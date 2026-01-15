@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<system xmlns="http://www.eiffel.com/developers/xml/configuration-1-23-0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.eiffel.com/developers/xml/configuration-1-23-0 http://www.eiffel.com/developers/xml/configuration-1-23-0.xsd" name="simple_vulkan" uuid="E7A1B2C3-D4E5-F6A7-B8C9-D0E1F2A3B4C5" library_target="simple_vulkan">
+	<description>Vulkan GPU compute library for the simple_* ecosystem. Cross-platform GPU acceleration for NVIDIA, AMD, and Intel GPUs.</description>
+	<target name="simple_vulkan">
+		<root all_classes="true"/>
+		<version major="0" minor="1" release="0" build="1"/>
+		<option warning="warning" manifest_array_type="mismatch_warning">
+			<assertions precondition="true" postcondition="true" check="true" invariant="true" loop="true" supplier_precondition="true"/>
+		</option>
+		<setting name="console_application" value="true"/>
+		<setting name="dead_code_removal" value="feature"/>
+		<capability>
+			<concurrency support="scoop"/>
+			<void_safety support="all"/>
+		</capability>
+		<library name="base" location="$ISE_LIBRARY\library\base\base.ecf"/>
+		<external_include location="$SIMPLE_EIFFEL\simple_vulkan\Clib"/>
+		<external_include location="$VULKAN_SDK\Include"/>
+		<external_object location="$SIMPLE_EIFFEL\simple_vulkan\Clib\simple_vulkan.lib">
+			<condition>
+				<platform value="windows"/>
+			</condition>
+		</external_object>
+		<external_object location="$VULKAN_SDK\Lib\vulkan-1.lib">
+			<condition>
+				<platform value="windows"/>
+			</condition>
+		</external_object>
+		<cluster name="src" location=".\src\" recursive="true"/>
+	</target>
+	<target name="simple_vulkan_tests" extends="simple_vulkan">
+		<description>Test target for simple_vulkan</description>
+		<root class="TEST_APP" feature="make"/>
+		<library name="simple_testing" location="$SIMPLE_EIFFEL\simple_testing\simple_testing.ecf"/>
+		<library name="testing" location="$ISE_LIBRARY\library\testing\testing.ecf"/>
+		<cluster name="test_classes" location=".\testing\" recursive="true"/>
+	</target>
+</system>
