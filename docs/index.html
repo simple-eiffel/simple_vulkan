@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>simple_vulkan - GPU Compute Library for Eiffel</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <header>
+        <div class="logo-container">
+            <img src="images/logo.png" alt="simple_* logo" class="logo">
+        </div>
+        <h1>simple_vulkan</h1>
+        <p class="tagline">Cross-Platform GPU Compute for Eiffel via Vulkan</p>
+        <div class="badges">
+            <span class="badge badge-version">v1.0.0</span>
+            <span class="badge badge-license">MIT</span>
+            <span class="badge badge-rfc">Vulkan 1.3</span>
+        </div>
+    </header>
+
+    <nav>
+        <ul>
+            <li><a href="#overview">Overview</a></li>
+            <li><a href="#quick-start">Quick Start</a></li>
+            <li><a href="#features">Features</a></li>
+            <li><a href="#api-reference">API Reference</a></li>
+            <li><a href="#shaders">Compute Shaders</a></li>
+            <li><a href="https://github.com/simple-eiffel/simple_vulkan">GitHub</a></li>
+        </ul>
+    </nav>
+
+    <main>
+        <section id="overview">
+            <h2>Overview</h2>
+            <p>
+                <strong>simple_vulkan</strong> provides GPU compute capabilities through the Vulkan API,
+                enabling high-performance parallel computation on modern GPUs. Designed for compute-intensive
+                tasks like SDF ray marching, it achieves <strong>63 FPS at 4K resolution</strong> on supported hardware.
+            </p>
+            <p>
+                Supports NVIDIA, AMD, and Intel GPUs with automatic device selection that prioritizes
+                discrete GPUs over integrated graphics.
+            </p>
+            <p>
+                Part of the <a href="https://github.com/simple-eiffel">Simple Eiffel</a> ecosystem.
+            </p>
+        </section>
+
+        <section id="quick-start">
+            <h2>Quick Start</h2>
+
+            <h3>Prerequisites</h3>
+            <ol>
+                <li>Install <a href="https://vulkan.lunarg.com/sdk/home">Vulkan SDK</a></li>
+                <li>Set the environment variable:
+<pre><code>set SIMPLE_EIFFEL=D:\prod</code></pre>
+                </li>
+            </ol>
+
+            <h3>Installation</h3>
+            <ol>
+                <li>Build the C library (one-time):
+<pre><code>cd D:\prod\simple_vulkan
+build_clib.bat</code></pre>
+                </li>
+                <li>Add to your ECF file:
+<pre><code>&lt;library name="simple_vulkan" location="$SIMPLE_EIFFEL/simple_vulkan/simple_vulkan.ecf"/&gt;</code></pre>
+                </li>
+            </ol>
+
+            <h3>Basic Usage</h3>
+<pre><code><span class="keyword">local</span>
+    vk: <span class="type">SIMPLE_VULKAN</span>
+    ctx: <span class="type">VULKAN_CONTEXT</span>
+<span class="keyword">do</span>
+    <span class="keyword">create</span> vk
+    ctx := vk.create_context
+
+    <span class="keyword">if</span> ctx.is_valid <span class="keyword">then</span>
+        print (<span class="string">"GPU: "</span> + ctx.device_name)
+        print (<span class="string">"Discrete: "</span> + ctx.is_discrete_gpu.out)
+        ctx.dispose
+    <span class="keyword">end</span>
+<span class="keyword">end</span></code></pre>
+        </section>
+
+        <section id="features">
+            <h2>Key Features</h2>
+
+            <div class="feature-grid">
+                <div class="feature-card">
+                    <h4>Cross-Platform GPU</h4>
+                    <p>Works on NVIDIA, AMD, and Intel GPUs via Vulkan API.</p>
+                </div>
+
+                <div class="feature-card">
+                    <h4>Automatic Device Selection</h4>
+                    <p>Prioritizes discrete GPUs over integrated for maximum performance.</p>
+                </div>
+
+                <div class="feature-card">
+                    <h4>Buffer Management</h4>
+                    <p>Create, upload, and download GPU buffers with simple API.</p>
+                </div>
+
+                <div class="feature-card">
+                    <h4>Compute Shaders</h4>
+                    <p>Load and execute SPIR-V compute shaders for parallel computation.</p>
+                </div>
+
+                <div class="feature-card">
+                    <h4>Image Output</h4>
+                    <p>Create GPU images for rendering results and visualization.</p>
+                </div>
+
+                <div class="feature-card">
+                    <h4>Push Constants</h4>
+                    <p>Fast-changing uniforms for real-time applications.</p>
+                </div>
+
+                <div class="feature-card">
+                    <h4>Vendor Detection</h4>
+                    <p>Query GPU vendor for vendor-specific optimizations.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="api-reference">
+            <h2>API Reference</h2>
+
+            <div class="api-section">
+                <h3>SIMPLE_VULKAN (Facade)</h3>
+                <p>Main entry point for Vulkan operations.</p>
+
+                <div class="signature">create_context: VULKAN_CONTEXT</div>
+                <p>Create a new Vulkan context with automatic GPU selection.</p>
+
+                <div class="signature">create_buffer (ctx: VULKAN_CONTEXT; size: INTEGER_64; usage: INTEGER): VULKAN_BUFFER</div>
+                <p>Create a GPU buffer with specified size and usage flags.</p>
+
+                <div class="signature">load_shader (ctx: VULKAN_CONTEXT; path: STRING): VULKAN_SHADER</div>
+                <p>Load a SPIR-V compute shader from file.</p>
+
+                <div class="signature">create_pipeline (ctx: VULKAN_CONTEXT; shader: VULKAN_SHADER): VULKAN_PIPELINE</div>
+                <p>Create a compute pipeline for shader execution.</p>
+            </div>
+
+            <div class="api-section">
+                <h3>VULKAN_CONTEXT</h3>
+                <p>GPU context with device information.</p>
+
+                <table class="api-table">
+                    <tr>
+                        <th>Feature</th>
+                        <th>Description</th>
+                    </tr>
+                    <tr>
+                        <td><code>is_valid</code></td>
+                        <td>True if context was created successfully</td>
+                    </tr>
+                    <tr>
+                        <td><code>device_name</code></td>
+                        <td>GPU device name string</td>
+                    </tr>
+                    <tr>
+                        <td><code>is_discrete_gpu</code></td>
+                        <td>True if using discrete GPU</td>
+                    </tr>
+                    <tr>
+                        <td><code>vendor_id</code></td>
+                        <td>GPU vendor ID (NVIDIA=0x10DE, AMD=0x1002, Intel=0x8086)</td>
+                    </tr>
+                    <tr>
+                        <td><code>dispose</code></td>
+                        <td>Release all Vulkan resources</td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="api-section">
+                <h3>VULKAN_BUFFER</h3>
+                <p>GPU buffer for data storage and transfer.</p>
+
+                <table class="api-table">
+                    <tr>
+                        <th>Feature</th>
+                        <th>Description</th>
+                    </tr>
+                    <tr>
+                        <td><code>upload (data, size, offset)</code></td>
+                        <td>Upload data from CPU to GPU buffer</td>
+                    </tr>
+                    <tr>
+                        <td><code>download (data, size, offset)</code></td>
+                        <td>Download data from GPU buffer to CPU</td>
+                    </tr>
+                    <tr>
+                        <td><code>dispose</code></td>
+                        <td>Free GPU memory</td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="api-section">
+                <h3>VULKAN_PIPELINE</h3>
+                <p>Compute pipeline for shader execution.</p>
+
+                <table class="api-table">
+                    <tr>
+                        <th>Feature</th>
+                        <th>Description</th>
+                    </tr>
+                    <tr>
+                        <td><code>bind_buffer (binding, buffer)</code></td>
+                        <td>Bind buffer to shader binding point</td>
+                    </tr>
+                    <tr>
+                        <td><code>dispatch (ctx, x, y, z)</code></td>
+                        <td>Dispatch compute workgroups</td>
+                    </tr>
+                    <tr>
+                        <td><code>wait_idle (ctx)</code></td>
+                        <td>Wait for GPU operations to complete</td>
+                    </tr>
+                    <tr>
+                        <td><code>dispose</code></td>
+                        <td>Release pipeline resources</td>
+                    </tr>
+                </table>
+            </div>
+
+            <h3>Buffer Usage Flags</h3>
+            <table class="api-table">
+                <tr>
+                    <th>Flag</th>
+                    <th>Value</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>Buffer_storage</code></td>
+                    <td>0x01</td>
+                    <td>Shader storage buffer (SSBO)</td>
+                </tr>
+                <tr>
+                    <td><code>Buffer_uniform</code></td>
+                    <td>0x02</td>
+                    <td>Uniform buffer for constants</td>
+                </tr>
+                <tr>
+                    <td><code>Buffer_transfer</code></td>
+                    <td>0x04</td>
+                    <td>Enable CPU upload/download</td>
+                </tr>
+            </table>
+        </section>
+
+        <section id="shaders">
+            <h2>Writing Compute Shaders</h2>
+
+            <p>Compute shaders must be written in GLSL and compiled to SPIR-V format.</p>
+
+            <h3>Example Shader</h3>
+<pre><code><span class="comment">#version 450</span>
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer InputBuffer { float data[]; };
+layout(std430, binding = 1) buffer OutputBuffer { float result[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    result[idx] = data[idx] * 2.0;
+}</code></pre>
+
+            <h3>Compile to SPIR-V</h3>
+<pre><code>%VULKAN_SDK%\Bin\glslc.exe shader.comp -o shader.spv</code></pre>
+
+            <h3>Complete GPU Compute Example</h3>
+<pre><code><span class="keyword">local</span>
+    vk: <span class="type">SIMPLE_VULKAN</span>
+    ctx: <span class="type">VULKAN_CONTEXT</span>
+    shader: <span class="type">VULKAN_SHADER</span>
+    pipeline: <span class="type">VULKAN_PIPELINE</span>
+    input_buf, output_buf: <span class="type">VULKAN_BUFFER</span>
+<span class="keyword">do</span>
+    <span class="keyword">create</span> vk
+    ctx := vk.create_context
+
+    <span class="keyword">if</span> ctx.is_valid <span class="keyword">then</span>
+        <span class="comment">-- Load compute shader (SPIR-V)</span>
+        shader := vk.load_shader (ctx, <span class="string">"compute.spv"</span>)
+
+        <span class="keyword">if</span> shader.is_valid <span class="keyword">then</span>
+            <span class="comment">-- Create pipeline</span>
+            pipeline := vk.create_pipeline (ctx, shader)
+
+            <span class="comment">-- Create and bind buffers</span>
+            input_buf := vk.create_buffer (ctx, 4096, vk.Buffer_storage)
+            output_buf := vk.create_buffer (ctx, 4096, vk.Buffer_storage)
+            pipeline.bind_buffer (0, input_buf).do_nothing
+            pipeline.bind_buffer (1, output_buf).do_nothing
+
+            <span class="comment">-- Upload data, dispatch, download results</span>
+            input_buf.upload (data.item, 4096, 0).do_nothing
+            pipeline.dispatch (ctx, 64, 1, 1).do_nothing
+            pipeline.wait_idle (ctx)
+            output_buf.download (result.item, 4096, 0).do_nothing
+
+            <span class="comment">-- Cleanup</span>
+            pipeline.dispose
+            input_buf.dispose
+            output_buf.dispose
+            shader.dispose
+        <span class="keyword">end</span>
+        ctx.dispose
+    <span class="keyword">end</span>
+<span class="keyword">end</span></code></pre>
+        </section>
+
+        <section id="performance">
+            <h2>Performance</h2>
+
+            <p>Tested on NVIDIA GeForce RTX 5070 Ti:</p>
+            <table class="api-table">
+                <tr>
+                    <th>Operation</th>
+                    <th>Performance</th>
+                </tr>
+                <tr>
+                    <td>Context creation</td>
+                    <td>&lt;10ms</td>
+                </tr>
+                <tr>
+                    <td>Buffer operations</td>
+                    <td>Near-instant</td>
+                </tr>
+                <tr>
+                    <td>4K SDF ray marching</td>
+                    <td>63 FPS (3840x2160)</td>
+                </tr>
+            </table>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2025 simple_* ecosystem. MIT License.</p>
+        <p>
+            <a href="https://github.com/simple-eiffel/simple_vulkan">GitHub</a> |
+            <a href="https://simple-eiffel.github.io">Documentation</a>
+        </p>
+    </footer>
+</body>
+</html>
