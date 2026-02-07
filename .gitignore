@@ -1,3 +1,6 @@
 EIFGENs/
 *.obj
 *.lib
+*.melted
+*.epr
+*.log
