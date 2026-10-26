@@ -151,6 +151,7 @@ void svk_wait_idle(svk_context ctx);
 #define SVK_MAX_PUSH_BYTES 128
 
 int svk_has_device_address(svk_context ctx);
+int svk_has_cooperative_matrix_bf16(svk_context ctx);   /* 0.6.0 */
 svk_buffer svk_create_device_buffer(svk_context ctx, uint64_t size);
 uint64_t svk_buffer_address(svk_context ctx, svk_buffer buf);
 int svk_write_buffer(svk_context ctx, svk_buffer buf, const void* data, uint64_t size, uint64_t offset);

@@ -1,5 +1,13 @@
 # Changelog: simple_vulkan
 
+## 0.6.0 (2026-10-26): bf16 cooperative matrices (tensor cores)
+- The instance asks for Vulkan 1.3, so kernels compiled for SPIR-V 1.6 can run.
+- The device enables bf16 cooperative matrices only when it offers the whole set. Otherwise nothing extra is enabled.
+  - The set: Vulkan 1.3, VK_KHR_cooperative_matrix, VK_KHR_shader_bfloat16 (bf16 type and bf16 cooperative matrices), the Vulkan memory model, and a 16×16×16 subgroup shape with bf16 A and B and f32 C and result.
+- `VULKAN_CONTEXT.has_cooperative_matrix_bf16` says whether it did.
+- Test: one subgroup multiplies two 16×16 bf16 tiles on the tensor cores. The f32 result equals the host's exactly; the inputs are small integers, which bf16 holds exactly. It is skipped on devices without the feature. 17/17; simple_sdf 26/26.
+- Shaders using it are compiled with simple_shaderc 0.2.0's `set_target_vulkan_1_3`.
+
 ## 0.5.0 (2026-10-26): recorded uploads
 - `VULKAN_DEVICE_BUFFER.record_write`: copies host data into a per-batch upload arena now and records its copy into the batch, ordered with the other commands, without flushing. The arena has up to 64 host-visible chunks of at least 4 MB and is reset after each flush's fence; if it is full, the call falls back to `write`. Small per-step uploads (token ids, targets, gather layouts) no longer drain the GPU.
 - Test: three payloads (two small, one of 8 MB) recorded into one batch, with the host buffer reused between them, and a dispatch reading one; nothing flushes until the read, and every buffer holds its own payload. 16/16.

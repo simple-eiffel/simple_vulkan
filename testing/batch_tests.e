@@ -38,6 +38,11 @@ feature -- Execution
 				check_that ("pool: recycled buffer reused by size, reuse ordered after old use, limit and trim", pool_reuse)
 				check_that ("profiling: 200 dispatches timed on the GPU, none when off", profiling)
 				check_that ("recorded uploads: three payloads in one batch, no flush, all intact", recorded_uploads)
+				if ctx.has_cooperative_matrix_bf16 then
+					check_that ("cooperative matrix: 16x16 bf16 product on tensor cores = host's", cooperative_matrix_bf16)
+				else
+					print ("Test: cooperative matrix... SKIP (no bf16 cooperative matrices on this device)%N")
+				end
 			else
 				print ("Test: compute batches... SKIP (no device addresses)%N")
 			end
@@ -348,22 +353,76 @@ feature {NONE} -- Tests
 			x.dispose
 		end
 
+	cooperative_matrix_bf16: BOOLEAN
+			-- C = A B for 16 x 16 A and B of small integers (exact in bf16 and in the f32
+			-- accumulator), one subgroup on the cooperative-matrix path (0.6.0).
+		local
+			a, b, c: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_a, l_b, l_c, l_push: MANAGED_POINTER
+			i, j, k: INTEGER
+			l_sum: REAL_32
+		do
+			create l_a.make (1024); create l_b.make (1024); create l_c.make (1024)
+			from i := 0 until i = 256 loop
+				l_a.put_real_32 ((i \\ 7 - 3).to_real, i * 4)
+				l_b.put_real_32 ((i \\ 5 - 2).to_real, i * 4)
+				i := i + 1
+			end
+			create a.make (ctx, 1024); create b.make (ctx, 1024); create c.make (ctx, 1024)
+			if attached pipeline_for (Coop_bf16_glsl, True) as l_p then
+				p := l_p
+				create l_push.make (24)
+				l_push.put_natural_64 (a.address, 0)
+				l_push.put_natural_64 (b.address, 8)
+				l_push.put_natural_64 (c.address, 16)
+				Result := a.write (l_a.item, 1024, 0) and b.write (l_b.item, 1024, 0)
+					and p.record (l_push.item, 24, 1, 1, 1)
+					and c.read (l_c.item, 1024, 0)
+				from i := 0 until not Result or i = 16 loop
+					from j := 0 until not Result or j = 16 loop
+						l_sum := 0.0
+						from k := 0 until k = 16 loop
+							l_sum := l_sum + l_a.read_real_32 ((i * 16 + k) * 4) * l_b.read_real_32 ((k * 16 + j) * 4)
+							k := k + 1
+						end
+						Result := l_c.read_real_32 ((i * 16 + j) * 4) = l_sum
+						j := j + 1
+					end
+					i := i + 1
+				end
+				p.dispose
+			end
+			a.dispose; b.dispose; c.dispose
+		end
+
 feature {NONE} -- Helpers
 
 	pipeline (a_glsl: STRING): detachable VULKAN_ADDRESS_PIPELINE
 			-- Address pipeline for `a_glsl', or Void when compilation fails.
+		do
+			Result := pipeline_for (a_glsl, False)
+		end
+
+	pipeline_for (a_glsl: STRING; a_vulkan_1_3: BOOLEAN): detachable VULKAN_ADDRESS_PIPELINE
+			-- Address pipeline for `a_glsl', compiled for Vulkan 1.3 / SPIR-V 1.6 when
+			-- `a_vulkan_1_3'; Void when compilation fails.
 		local
 			s: VULKAN_SHADER
+			l_shaderc: SIMPLE_SHADERC
 		do
-			if attached (create {SIMPLE_SHADERC}.make).compile_compute (a_glsl) as l_code then
+			create l_shaderc.make
+			l_shaderc.set_target_vulkan_1_3 (a_vulkan_1_3)
+			if attached l_shaderc.compile_compute (a_glsl) as l_code then
 				create s.make_from_memory (ctx, l_code.item, l_code.count.to_integer_64)
 				if s.is_valid then
 					create Result.make (ctx, s)
 					s.dispose
 				end
 			else
-				print ("  (shader compile failed)%N")
+				print ("  (shader compile failed: " + l_shaderc.last_error + ")%N")
 			end
+			l_shaderc.dispose
 		end
 
 	check_that (a_name: STRING; a_ok: BOOLEAN)
@@ -379,6 +438,31 @@ feature {NONE} -- Helpers
 		end
 
 feature {NONE} -- Shaders
+
+	Coop_bf16_glsl: STRING = "[
+		#version 460
+		#extension GL_EXT_buffer_reference : require
+		#extension GL_KHR_cooperative_matrix : require
+		#extension GL_KHR_memory_scope_semantics : require
+		#extension GL_EXT_bfloat16 : require
+		layout(local_size_x = 32) in;
+		layout(buffer_reference, std430, buffer_reference_align = 4) buffer F { float v[]; };
+		layout(push_constant) uniform P { F a; F b; F c; } p;
+		shared bfloat16_t As[256];
+		shared bfloat16_t Bs[256];
+		void main() {
+			uint t = gl_LocalInvocationID.x;
+			for (uint i = t; i < 256u; i += 32u) { As[i] = bfloat16_t(p.a.v[i]); Bs[i] = bfloat16_t(p.b.v[i]); }
+			barrier();
+			coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+			coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+			coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+			coopMatLoad(ma, As, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+			coopMatLoad(mb, Bs, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+			acc = coopMatMulAdd(ma, mb, acc);
+			coopMatStore(acc, p.c.v, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+		}
+	]"
 
 	Add_glsl: STRING = "[
 		#version 460

@@ -139,6 +139,16 @@ feature -- Compute batches (0.2.0)
 			Result := svk_has_device_address (handle) /= 0
 		end
 
+	has_cooperative_matrix_bf16: BOOLEAN
+			-- Are bf16 cooperative matrices (tensor cores) enabled: Vulkan 1.3 kernels
+			-- (SPIR-V 1.6) may use 16x16x16 subgroup tiles of bf16 A and B with f32
+			-- accumulators (0.6.0)?
+		require
+			valid: is_valid
+		do
+			Result := svk_has_cooperative_matrix_bf16 (handle) /= 0
+		end
+
 	pending_commands: INTEGER
 			-- Dispatches, copies and fills recorded since the last `flush'.
 		require
@@ -290,6 +300,13 @@ feature {NONE} -- C Externals
 			"C inline use <simple_vulkan.h>"
 		alias
 			"return svk_has_device_address((svk_context)$ctx);"
+		end
+
+	svk_has_cooperative_matrix_bf16 (ctx: POINTER): INTEGER
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return svk_has_cooperative_matrix_bf16((svk_context)$ctx);"
 		end
 
 	svk_pending_commands (ctx: POINTER): NATURAL_32
