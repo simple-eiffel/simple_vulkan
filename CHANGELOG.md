@@ -1,5 +1,24 @@
 # Changelog: simple_vulkan
 
+## 0.7.0 (2026-10-26): asynchronous submission
+- **Before:** recorded work ran only at a flush, which submitted and then waited. A training step's whole recording happened while the GPU sat idle, and then the host sat idle while the GPU ran it.
+- **Now:** recording uses a ring of 3 slots. Each slot has its own command buffer, fence, upload arena, deferred-free list and timestamp queries.
+  - Every 128 commands, the open slot is submitted without waiting, and recording moves on, so host and GPU work at once.
+  - A slot is reused only after its fence.
+  - `flush` keeps its meaning: it submits the open slot and waits for every slot.
+- **Order:** commands still run in recorded order across slots. Each command's full barrier also scopes earlier and later submissions on the queue, so slots complete in order.
+- **Frees:** a buffer released while work may use it is destroyed after that work completes. It waits behind the open slot, or behind the last submitted slot still in flight.
+- **Synchronous paths** (upload, download, free, descriptor dispatch, pipeline free) now always flush. Work may be in flight with no slot open.
+- **`pending_commands`** counts commands recorded since the last flush, some of which may already have run. The new `slots_in_flight` counts submissions not yet waited on. `flush` ensures `slots_in_flight = 0`.
+- **Barriers:** the barrier after an ordinary command now covers device work only (compute and transfer). The host-visible barrier stays on the copies a read waits on.
+- **Counters:** `flush_count` counts flushes that waited on work, and `wait_ms` is the host's total time waiting on fences.
+- **Effect on RixGPT training** (simple_tensor): f32 334 → 317 ms/step, mixed 288 → 269 ms/step. The host now waits on the GPU for about 91% of a step, so the step is GPU-bound.
+  - What remains is per-dispatch time on the GPU: about 1,700 barrier-separated dispatches per step. The cure is fusing ops into fewer dispatches.
+  - Submitting every 32 commands instead of 128 changed nothing measurable.
+- **Test:**
+  - A fill and 400 dependent increments go out in slots while recording continues, with the ring wrapping. Every element ends at 400.
+  - A buffer released while its slots are in flight is queued, both with a slot open and with none open, and is freed by the flush.
+
 ## 0.6.0 (2026-10-26): bf16 cooperative matrices (tensor cores)
 - The instance asks for Vulkan 1.3, so kernels compiled for SPIR-V 1.6 can run.
 - The device enables bf16 cooperative matrices only when it offers the whole set. Otherwise nothing extra is enabled.

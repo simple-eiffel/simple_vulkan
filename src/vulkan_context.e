@@ -150,15 +150,49 @@ feature -- Compute batches (0.2.0)
 		end
 
 	pending_commands: INTEGER
-			-- Dispatches, copies and fills recorded since the last `flush'.
+			-- Dispatches, copies and fills recorded since the last `flush'. Since 0.7.0 every
+			-- 128 of them are submitted without waiting, so some may already have run.
 		require
 			valid: is_valid
 		do
 			Result := svk_pending_commands (handle).to_integer_32
 		end
 
+	slots_in_flight: INTEGER
+			-- Submitted command buffers the GPU may still be running (0.7.0: recording uses a
+			-- ring of 3; each is submitted after 128 commands without waiting).
+		require
+			valid: is_valid
+		do
+			Result := svk_slots_in_flight (handle).to_integer_32
+		ensure
+			at_most_three: 0 <= Result and Result <= 3
+		end
+
+	flush_count: INTEGER_64
+			-- Flushes so far that waited on work (each drains the GPU): a count to watch, since
+			-- one in the middle of a stream of work stops the host and the GPU overlapping.
+		require
+			valid: is_valid
+		do
+			Result := svk_flush_count (handle).to_integer_64
+		ensure
+			non_negative: Result >= 0
+		end
+
+	wait_ms: REAL_64
+			-- Host time spent so far waiting for the GPU (fence waits). Wall time minus this is
+			-- the time the host itself took, recording included.
+		require
+			valid: is_valid
+		do
+			Result := svk_wait_ns (handle).to_real_64 / 1.0e6
+		ensure
+			non_negative: Result >= 0.0
+		end
+
 	flush
-			-- Run everything recorded and wait for the GPU to finish it.
+			-- Submit everything recorded and wait for the GPU to finish all of it.
 			-- (A blocking external: another SCOOP processor's collector never waits on it.)
 		require
 			valid: is_valid
@@ -166,13 +200,15 @@ feature -- Compute batches (0.2.0)
 			last_flush_succeeded := svk_flush (handle) /= 0
 		ensure
 			nothing_pending: last_flush_succeeded implies pending_commands = 0
+			nothing_in_flight: slots_in_flight = 0
 		end
 
 	last_flush_succeeded: BOOLEAN
 			-- Did the last `flush' submit and complete?
 
 	queued_frees: INTEGER
-			-- Device buffers released while a batch was open, freed at the next flush.
+			-- Device buffers released while recorded work might still use them, freed once
+			-- that work completes (at the latest, the next flush).
 		require
 			valid: is_valid
 		do
@@ -307,6 +343,27 @@ feature {NONE} -- C Externals
 			"C inline use <simple_vulkan.h>"
 		alias
 			"return svk_has_cooperative_matrix_bf16((svk_context)$ctx);"
+		end
+
+	svk_wait_ns (ctx: POINTER): NATURAL_64
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return svk_wait_ns((svk_context)$ctx);"
+		end
+
+	svk_flush_count (ctx: POINTER): NATURAL_64
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return svk_flush_count((svk_context)$ctx);"
+		end
+
+	svk_slots_in_flight (ctx: POINTER): NATURAL_32
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return svk_slots_in_flight((svk_context)$ctx);"
 		end
 
 	svk_pending_commands (ctx: POINTER): NATURAL_32

@@ -38,6 +38,7 @@ feature -- Execution
 				check_that ("pool: recycled buffer reused by size, reuse ordered after old use, limit and trim", pool_reuse)
 				check_that ("profiling: 200 dispatches timed on the GPU, none when off", profiling)
 				check_that ("recorded uploads: three payloads in one batch, no flush, all intact", recorded_uploads)
+				check_that ("async submission: 400 increments go out in slots while recording, in order; frees wait for them", async_submission)
 				if ctx.has_cooperative_matrix_bf16 then
 					check_that ("cooperative matrix: 16x16 bf16 product on tensor cores = host's", cooperative_matrix_bf16)
 				else
@@ -351,6 +352,58 @@ feature {NONE} -- Tests
 				p.dispose
 			end
 			x.dispose
+		end
+
+	async_submission: BOOLEAN
+			-- 0.7.0: a fill and 400 dependent increments of `x' (more than three slots' worth,
+			-- so the ring wraps) are submitted in slots of 128 while recording continues, with
+			-- no flush; they still run in order (every element ends at 400). A buffer released
+			-- while its slots are in flight is queued, not destroyed, until they complete;
+			-- likewise when no slot is open but one is in flight.
+		local
+			x, keep, y: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_push, l_host: MANAGED_POINTER
+			i: INTEGER
+		do
+			create x.make (ctx, 4096)
+			create keep.make (ctx, 4096)
+			create y.make (ctx, 4096)
+			create l_host.make (4096)
+			ctx.flush
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (x.address, 0)
+				l_push.put_natural_32 (1024, 8)
+				Result := x.record_fill (0, 4096, 0)
+				from i := 1 until not Result or i > 400 loop
+					Result := p.record (l_push.item, 12, 4, 1, 1)
+					i := i + 1
+				end
+				Result := Result and ctx.pending_commands = 401 and ctx.slots_in_flight >= 1
+				Result := Result and x.record_copy_to (keep, 0, 0, 4096)
+				x.release_deferred
+				Result := Result and ctx.queued_frees = 1
+				ctx.flush
+				Result := Result and ctx.last_flush_succeeded and ctx.queued_frees = 0 and ctx.slots_in_flight = 0
+				Result := Result and keep.read (l_host.item, 4096, 0)
+					and l_host.read_real_32 (0) = 400.0 and l_host.read_real_32 (4092) = 400.0
+					-- Exactly one slot's worth: it is submitted, none is open, one is in flight.
+				l_push.put_natural_64 (y.address, 0)
+				Result := Result and y.record_fill (0, 4096, 0)
+				from i := 2 until not Result or i > 128 loop
+					Result := p.record (l_push.item, 12, 4, 1, 1)
+					i := i + 1
+				end
+				Result := Result and ctx.slots_in_flight >= 1
+				y.release_deferred
+				Result := Result and ctx.queued_frees = 1
+				ctx.flush
+				Result := Result and ctx.queued_frees = 0
+				p.dispose
+			end
+			keep.dispose
 		end
 
 	cooperative_matrix_bf16: BOOLEAN

@@ -10,11 +10,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include "simple_vulkan.h"
 
 /* ============================================================================
  * Internal Structures
  * ============================================================================ */
+
+/* Asynchronous submission (0.7.0): recorded commands go into a ring of slots, each with
+   its own command buffer, fence, upload arena, deferred frees and timestamp queries. A
+   slot is submitted without waiting every SVK_SUBMIT_EVERY commands, so the GPU runs
+   while the host records; a flush submits the open slot and waits for all of them. */
+#define SVK_SLOTS 3u
+#define SVK_SUBMIT_EVERY 128u
+#define SVK_ARENA_CHUNKS 16u
+
+struct svk_slot_t {
+    VkCommandBuffer cmd;
+    VkFence fence;
+    int in_flight;
+    struct svk_buffer_t** frees;        /* destroyed once this slot's work has completed */
+    uint32_t free_count;
+    uint32_t free_capacity;
+    VkBuffer arena_buffer[SVK_ARENA_CHUNKS];   /* recorded uploads, reset at completion */
+    VkDeviceMemory arena_memory[SVK_ARENA_CHUNKS];
+    void* arena_mapped[SVK_ARENA_CHUNKS];
+    uint64_t arena_size[SVK_ARENA_CHUNKS];
+    uint64_t arena_used[SVK_ARENA_CHUNKS];
+    uint32_t arena_count;
+    VkQueryPool query_pool;             /* two timestamps per profiled dispatch */
+    struct svk_pipeline_t** prof_pipes;
+    uint32_t prof_count;
+};
 
 struct svk_context_t {
     VkInstance instance;
@@ -40,31 +67,26 @@ struct svk_context_t {
        dispatches recorded into one command buffer, submitted at a flush. */
     int has_device_address;
     int has_coop_bf16;             /* 0.6.0: bf16 cooperative matrices (tensor cores) enabled */
-    VkCommandBuffer batch_cmd;
+    VkCommandBuffer batch_cmd;     /* the open slot's command buffer */
     int batch_open;
-    uint32_t batch_count;
-    VkFence batch_fence;
+    uint32_t batch_count;          /* commands in the open slot */
+    struct svk_slot_t slots[SVK_SLOTS];
+    uint32_t slot_cur;             /* the slot being recorded, or the next to open */
+    uint32_t since_flush;          /* commands recorded since the last flush */
+    uint64_t flush_count;          /* flushes (full waits) so far: each one drains the GPU */
+    uint64_t wait_ns;              /* host time spent waiting on fences */
     VkBuffer xfer_buffer;          /* host-visible staging for device-local transfers */
     VkDeviceMemory xfer_memory;
     void* xfer_mapped;
     uint64_t xfer_size;
-    struct svk_buffer_t** free_queue;   /* buffers freed while a batch was open */
-    uint32_t free_count;
-    uint32_t free_capacity;
     struct svk_buffer_t** pool;         /* recycled device buffers, matched by exact size */
     uint32_t pool_count;
     uint32_t pool_capacity;
     uint64_t pool_bytes;
     uint64_t pool_limit;
     uint64_t pool_hits;
-    /* Recorded uploads (0.5.0): host-visible arena chunks, reset after each flush */
-    VkBuffer arena_buffer[64];
-    VkDeviceMemory arena_memory[64];
-    void* arena_mapped[64];
-    uint64_t arena_size[64];
-    uint64_t arena_used[64];
-    uint32_t arena_count;
-    /* Profiling (0.4.0): a timestamp before and after each recorded dispatch */
+    /* Profiling (0.4.0): a timestamp before and after each recorded dispatch, in the
+       open slot's query pool (query_pool and prof_pipes alias the open slot's) */
     int profiling;
     VkQueryPool query_pool;
     struct svk_pipeline_t** prof_pipes;
@@ -346,10 +368,6 @@ svk_context svk_init(void) {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 }
     };
 
-    /* Fence for compute batches */
-    VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    vkCreateFence(ctx->device, &fence_info, NULL, &ctx->batch_fence);
-
     VkDescriptorPoolCreateInfo desc_pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, /* sets return on svk_free_pipeline */
@@ -390,20 +408,23 @@ void svk_cleanup(svk_context ctx) {
         vkDestroyBuffer(ctx->device, ctx->xfer_buffer, NULL);
         vkFreeMemory(ctx->device, ctx->xfer_memory, NULL);
     }
-    if (ctx->batch_fence) vkDestroyFence(ctx->device, ctx->batch_fence, NULL);
-    free(ctx->free_queue);
     for (uint32_t i = 0; i < ctx->pool_count; i++) {
         vkDestroyBuffer(ctx->device, ctx->pool[i]->buffer, NULL);
         vkFreeMemory(ctx->device, ctx->pool[i]->memory, NULL);
         free(ctx->pool[i]);
     }
     free(ctx->pool);
-    if (ctx->query_pool) vkDestroyQueryPool(ctx->device, ctx->query_pool, NULL);
-    free(ctx->prof_pipes);
-    for (uint32_t i = 0; i < ctx->arena_count; i++) {
-        vkUnmapMemory(ctx->device, ctx->arena_memory[i]);
-        vkDestroyBuffer(ctx->device, ctx->arena_buffer[i], NULL);
-        vkFreeMemory(ctx->device, ctx->arena_memory[i], NULL);
+    for (uint32_t k = 0; k < SVK_SLOTS; k++) {     /* the flush above emptied every free list */
+        struct svk_slot_t* s = &ctx->slots[k];
+        if (s->fence) vkDestroyFence(ctx->device, s->fence, NULL);
+        free(s->frees);
+        if (s->query_pool) vkDestroyQueryPool(ctx->device, s->query_pool, NULL);
+        free(s->prof_pipes);
+        for (uint32_t i = 0; i < s->arena_count; i++) {
+            vkUnmapMemory(ctx->device, s->arena_memory[i]);
+            vkDestroyBuffer(ctx->device, s->arena_buffer[i], NULL);
+            vkFreeMemory(ctx->device, s->arena_memory[i], NULL);
+        }
     }
 
     if (ctx->staging_buffer) {
@@ -471,7 +492,7 @@ svk_buffer svk_create_buffer(svk_context ctx, uint64_t size, uint32_t usage) {
 
 int svk_upload_buffer(svk_context ctx, svk_buffer buf, const void* data, uint64_t size, uint64_t offset) {
     if (!ctx || !buf || !data) return 0;
-    if (ctx->batch_open) svk_flush(ctx);
+    svk_flush(ctx);
     if (offset + size > buf->size) return 0;
 
     void* mapped;
@@ -484,7 +505,7 @@ int svk_upload_buffer(svk_context ctx, svk_buffer buf, const void* data, uint64_
 
 int svk_download_buffer(svk_context ctx, svk_buffer buf, void* data, uint64_t size, uint64_t offset) {
     if (!ctx || !buf || !data) return 0;
-    if (ctx->batch_open) svk_flush(ctx);
+    svk_flush(ctx);
     if (offset + size > buf->size) return 0;
 
     void* mapped;
@@ -501,7 +522,7 @@ uint64_t svk_buffer_size(svk_buffer buf) {
 
 void svk_free_buffer(svk_context ctx, svk_buffer buf) {
     if (!ctx || !buf) return;
-    if (ctx->batch_open) svk_flush(ctx);  /* a recorded dispatch may still use it */
+    svk_flush(ctx);  /* a recorded dispatch may still use it */
     vkDestroyBuffer(ctx->device, buf->buffer, NULL);
     vkFreeMemory(ctx->device, buf->memory, NULL);
     free(buf);
@@ -759,7 +780,7 @@ int svk_set_push_constants(svk_pipeline pipe, const void* data, uint32_t size) {
 
 int svk_dispatch(svk_context ctx, svk_pipeline pipe, uint32_t x, uint32_t y, uint32_t z) {
     if (!ctx || !pipe) return 0;
-    if (ctx->batch_open) svk_flush(ctx);  /* keep queue order with recorded work */
+    svk_flush(ctx);  /* keep queue order with recorded work */
 
     /* Allocate command buffer */
     VkCommandBufferAllocateInfo alloc_info = {
@@ -844,7 +865,7 @@ void svk_wait_idle(svk_context ctx) {
 
 void svk_free_pipeline(svk_context ctx, svk_pipeline pipe) {
     if (!ctx || !pipe) return;
-    if (ctx->batch_open) svk_flush(ctx);
+    svk_flush(ctx);
     if (pipe->desc_set) vkFreeDescriptorSets(ctx->device, ctx->descriptor_pool, 1, &pipe->desc_set);
     vkDestroyPipeline(ctx->device, pipe->pipeline, NULL);
     vkDestroyPipelineLayout(ctx->device, pipe->layout, NULL);
@@ -959,45 +980,128 @@ int svk_download_image(svk_context ctx, svk_image img, void* data) {
 
     return 1;
 }
-
 /* ============================================================================
- * Compute batches (0.2.0)
+ * Compute batches (0.2.0), submitted asynchronously (0.7.0)
  *
  * Device-local buffers carry a 64-bit device address that shaders read
  * through GL_EXT_buffer_reference, passed in push constants: address
  * pipelines need no descriptor sets. Dispatches, copies and fills are
- * recorded into one open command buffer, each followed by a full compute and
- * transfer memory barrier, and run when the batch is flushed (submit plus a
- * fence wait). Reads and writes of device-local buffers go through a
- * host-visible staging buffer and flush first, so they see all recorded work.
+ * recorded into the open slot's command buffer, each followed by a full
+ * compute and transfer memory barrier. Every SVK_SUBMIT_EVERY commands the
+ * slot is submitted without waiting and recording moves to the next slot, so
+ * the GPU works while the host records. The barrier's scopes cover earlier and
+ * later submissions on the queue too, so commands still run in recorded order
+ * across slots, and slots complete in order. A slot is reused only after its
+ * fence; a flush submits the open slot and waits for every slot. Reads and
+ * writes of device-local buffers go through a host-visible staging buffer and
+ * flush, so they see all recorded work.
  * ============================================================================ */
 
-#define SVK_BATCH_AUTO_FLUSH 16384u
 #define SVK_XFER_CHUNK (64ull * 1024ull * 1024ull)
 
-static void svk_drain_free_queue(svk_context ctx);
+static void svk_destroy_buffer_now(svk_context ctx, svk_buffer buf);
+
+/* Profiling queries for slot `s', created on first use. */
+static int svk_slot_profiling(svk_context ctx, struct svk_slot_t* s) {
+    if (s->query_pool) return 1;
+    VkQueryPoolCreateInfo qi = {
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = 2 * SVK_SUBMIT_EVERY
+    };
+    if (vkCreateQueryPool(ctx->device, &qi, NULL, &s->query_pool) != VK_SUCCESS) return 0;
+    s->prof_pipes = (struct svk_pipeline_t**) calloc(SVK_SUBMIT_EVERY, sizeof(struct svk_pipeline_t*));
+    return s->prof_pipes != NULL;
+}
+
+/* Wait for slot `s' if it is in flight, then settle it: add its GPU times to its
+   pipelines, reset its upload arena, destroy the buffers freed behind it. */
+static int svk_slot_complete(svk_context ctx, struct svk_slot_t* s) {
+    int ok = 1;
+    if (s->in_flight) {
+        struct timespec w0, w1;
+        timespec_get(&w0, TIME_UTC);
+        ok = vkWaitForFences(ctx->device, 1, &s->fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+        timespec_get(&w1, TIME_UTC);
+        ctx->wait_ns += (uint64_t) ((w1.tv_sec - w0.tv_sec) * 1000000000LL + (w1.tv_nsec - w0.tv_nsec));
+        vkResetFences(ctx->device, 1, &s->fence);
+        s->in_flight = 0;
+        if (ok && s->prof_count > 0 && s->query_pool) {
+            uint64_t* stamps = (uint64_t*) malloc(sizeof(uint64_t) * 2 * s->prof_count);
+            if (stamps && vkGetQueryPoolResults(ctx->device, s->query_pool, 0, 2 * s->prof_count,
+                    sizeof(uint64_t) * 2 * s->prof_count, stamps, sizeof(uint64_t),
+                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+                for (uint32_t i = 0; i < s->prof_count; i++) {
+                    svk_pipeline p = s->prof_pipes[i];
+                    if (p && stamps[2 * i + 1] >= stamps[2 * i]) {
+                        p->prof_ns += (uint64_t) ((double) (stamps[2 * i + 1] - stamps[2 * i]) * ctx->timestamp_period);
+                        p->prof_calls++;
+                    }
+                }
+            }
+            free(stamps);
+        }
+    }
+    s->prof_count = 0;
+    for (uint32_t i = 0; i < s->arena_count; i++) s->arena_used[i] = 0;
+    for (uint32_t i = 0; i < s->free_count; i++) svk_destroy_buffer_now(ctx, s->frees[i]);
+    s->free_count = 0;
+    return ok;
+}
 
 static int svk_batch_ensure_open(svk_context ctx) {
     if (ctx->batch_open) return 1;
-    if (!ctx->batch_cmd) {
+    struct svk_slot_t* s = &ctx->slots[ctx->slot_cur];
+    if (!svk_slot_complete(ctx, s)) return 0;     /* reuse a slot only after its fence */
+    if (!s->cmd) {
         VkCommandBufferAllocateInfo alloc_info = {
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = ctx->command_pool,
             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
             .commandBufferCount = 1
         };
-        if (vkAllocateCommandBuffers(ctx->device, &alloc_info, &ctx->batch_cmd) != VK_SUCCESS) return 0;
+        if (vkAllocateCommandBuffers(ctx->device, &alloc_info, &s->cmd) != VK_SUCCESS) return 0;
     }
+    if (!s->fence) {
+        VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        if (vkCreateFence(ctx->device, &fence_info, NULL, &s->fence) != VK_SUCCESS) return 0;
+    }
+    if (ctx->profiling && !svk_slot_profiling(ctx, s)) return 0;
     VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
     };
-    if (vkBeginCommandBuffer(ctx->batch_cmd, &begin_info) != VK_SUCCESS) return 0;
+    if (vkBeginCommandBuffer(s->cmd, &begin_info) != VK_SUCCESS) return 0;
+    ctx->batch_cmd = s->cmd;
     ctx->batch_open = 1;
     ctx->batch_count = 0;
     ctx->prof_count = 0;
-    if (ctx->profiling) vkCmdResetQueryPool(ctx->batch_cmd, ctx->query_pool, 0, 2 * SVK_BATCH_AUTO_FLUSH);
+    ctx->query_pool = s->query_pool;
+    ctx->prof_pipes = s->prof_pipes;
+    if (ctx->profiling) vkCmdResetQueryPool(s->cmd, s->query_pool, 0, 2 * SVK_SUBMIT_EVERY);
     return 1;
+}
+
+/* Submit the open slot without waiting; recording moves to the next slot. */
+static int svk_submit(svk_context ctx) {
+    struct svk_slot_t* s = &ctx->slots[ctx->slot_cur];
+    int ok = 0;
+    ctx->batch_open = 0;
+    s->prof_count = ctx->prof_count;
+    ctx->prof_count = 0;
+    ctx->batch_count = 0;
+    if (vkEndCommandBuffer(s->cmd) == VK_SUCCESS) {
+        VkSubmitInfo submit_info = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &s->cmd
+        };
+        ok = vkQueueSubmit(ctx->compute_queue, 1, &submit_info, s->fence) == VK_SUCCESS;
+    }
+    s->in_flight = ok;
+    if (!ok) svk_slot_complete(ctx, s);   /* nothing will run: settle it now */
+    ctx->slot_cur = (ctx->slot_cur + 1) % SVK_SLOTS;
+    return ok;
 }
 
 static void svk_batch_barrier(svk_context ctx) {
@@ -1014,60 +1118,42 @@ static void svk_batch_barrier(svk_context ctx) {
         0, 1, &barrier, 0, NULL, 0, NULL);
 }
 
+/* The barrier after an ordinary command: device work only (compute and transfer). The
+   host-visible variant, svk_batch_barrier, is kept for the copies that a read waits on. */
+static void svk_device_barrier(svk_context ctx) {
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT
+    };
+    vkCmdPipelineBarrier(ctx->batch_cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &barrier, 0, NULL, 0, NULL);
+}
+
 static void svk_batch_recorded(svk_context ctx) {
-    svk_batch_barrier(ctx);
+    svk_device_barrier(ctx);
     ctx->batch_count++;
-    if (ctx->batch_count >= SVK_BATCH_AUTO_FLUSH) svk_flush(ctx);
+    ctx->since_flush++;
+    if (ctx->batch_count >= SVK_SUBMIT_EVERY) svk_submit(ctx);
 }
 
 int svk_flush(svk_context ctx) {
     if (!ctx) return 0;
-    if (!ctx->batch_open) return 1;
-    ctx->batch_open = 0;
-    if (vkEndCommandBuffer(ctx->batch_cmd) != VK_SUCCESS) return 0;
-    VkSubmitInfo submit_info = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &ctx->batch_cmd
-    };
-    if (vkQueueSubmit(ctx->compute_queue, 1, &submit_info, ctx->batch_fence) != VK_SUCCESS) return 0;
-    VkResult waited = vkWaitForFences(ctx->device, 1, &ctx->batch_fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(ctx->device, 1, &ctx->batch_fence);
-    vkResetCommandBuffer(ctx->batch_cmd, 0);
-    ctx->batch_count = 0;
-    if (ctx->profiling && ctx->prof_count > 0) {
-        uint64_t* stamps = (uint64_t*) malloc(sizeof(uint64_t) * 2 * ctx->prof_count);
-        if (stamps && vkGetQueryPoolResults(ctx->device, ctx->query_pool, 0, 2 * ctx->prof_count,
-                sizeof(uint64_t) * 2 * ctx->prof_count, stamps, sizeof(uint64_t),
-                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
-            for (uint32_t i = 0; i < ctx->prof_count; i++) {
-                svk_pipeline p = ctx->prof_pipes[i];
-                if (p && stamps[2 * i + 1] >= stamps[2 * i]) {
-                    p->prof_ns += (uint64_t) ((double) (stamps[2 * i + 1] - stamps[2 * i]) * ctx->timestamp_period);
-                    p->prof_calls++;
-                }
-            }
-        }
-        free(stamps);
+    int ok = 1;
+    if (ctx->batch_open || svk_slots_in_flight(ctx) > 0) ctx->flush_count++;   /* one that waits on work */
+    if (ctx->batch_open) ok = svk_submit(ctx);
+    for (uint32_t i = 0; i < SVK_SLOTS; i++) {          /* oldest first */
+        if (!svk_slot_complete(ctx, &ctx->slots[(ctx->slot_cur + i) % SVK_SLOTS])) ok = 0;
     }
-    ctx->prof_count = 0;
-    for (uint32_t i = 0; i < ctx->arena_count; i++) ctx->arena_used[i] = 0;   /* the batch has consumed its uploads */
-    svk_drain_free_queue(ctx);
-    return waited == VK_SUCCESS;
+    ctx->since_flush = 0;
+    return ok;
 }
 
 int svk_set_profiling(svk_context ctx, int on) {
     if (!ctx) return 0;
-    if (on && !ctx->query_pool) {
-        VkQueryPoolCreateInfo qi = {
-            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-            .queryType = VK_QUERY_TYPE_TIMESTAMP,
-            .queryCount = 2 * SVK_BATCH_AUTO_FLUSH
-        };
-        if (vkCreateQueryPool(ctx->device, &qi, NULL, &ctx->query_pool) != VK_SUCCESS) return 0;
-        ctx->prof_pipes = (struct svk_pipeline_t**) calloc(SVK_BATCH_AUTO_FLUSH, sizeof(struct svk_pipeline_t*));
-        if (!ctx->prof_pipes) return 0;
-    }
     svk_flush(ctx);   /* a batch is profiled whole or not at all */
     ctx->profiling = on ? 1 : 0;
     return 1;
@@ -1083,37 +1169,57 @@ static void svk_destroy_buffer_now(svk_context ctx, svk_buffer buf) {
     free(buf);
 }
 
-static void svk_drain_free_queue(svk_context ctx) {
-    for (uint32_t i = 0; i < ctx->free_count; i++) svk_destroy_buffer_now(ctx, ctx->free_queue[i]);
-    ctx->free_count = 0;
-}
-
 void svk_free_buffer_deferred(svk_context ctx, svk_buffer buf) {
     if (!ctx || !buf) return;
-    if (!ctx->batch_open) {
+        /* Recorded work may use it: free it behind the open slot, or else behind the last
+           submitted one still in flight (slots complete in order); with none, free it now. */
+    struct svk_slot_t* s = NULL;
+    if (ctx->batch_open) {
+        s = &ctx->slots[ctx->slot_cur];
+    } else {
+        struct svk_slot_t* last = &ctx->slots[(ctx->slot_cur + SVK_SLOTS - 1) % SVK_SLOTS];
+        if (last->in_flight) s = last;
+    }
+    if (!s) {
         svk_destroy_buffer_now(ctx, buf);
         return;
     }
-    if (ctx->free_count == ctx->free_capacity) {
-        uint32_t cap = ctx->free_capacity ? 2 * ctx->free_capacity : 64;
-        struct svk_buffer_t** grown = (struct svk_buffer_t**) realloc(ctx->free_queue, cap * sizeof(*grown));
-        if (!grown) {                     /* cannot queue: run the batch, then free */
+    if (s->free_count == s->free_capacity) {
+        uint32_t cap = s->free_capacity ? 2 * s->free_capacity : 64;
+        struct svk_buffer_t** grown = (struct svk_buffer_t**) realloc(s->frees, cap * sizeof(*grown));
+        if (!grown) {                     /* cannot queue: run everything, then free */
             svk_flush(ctx);
             svk_destroy_buffer_now(ctx, buf);
             return;
         }
-        ctx->free_queue = grown;
-        ctx->free_capacity = cap;
+        s->frees = grown;
+        s->free_capacity = cap;
     }
-    ctx->free_queue[ctx->free_count++] = buf;
+    s->frees[s->free_count++] = buf;
 }
 
 uint32_t svk_queued_frees(svk_context ctx) {
-    return ctx ? ctx->free_count : 0;
+    uint32_t n = 0;
+    if (ctx) for (uint32_t k = 0; k < SVK_SLOTS; k++) n += ctx->slots[k].free_count;
+    return n;
+}
+
+uint64_t svk_flush_count(svk_context ctx) {
+    return ctx ? ctx->flush_count : 0;
+}
+
+uint64_t svk_wait_ns(svk_context ctx) {
+    return ctx ? ctx->wait_ns : 0;
+}
+
+uint32_t svk_slots_in_flight(svk_context ctx) {
+    uint32_t n = 0;
+    if (ctx) for (uint32_t k = 0; k < SVK_SLOTS; k++) n += ctx->slots[k].in_flight ? 1u : 0u;
+    return n;
 }
 
 uint32_t svk_pending_commands(svk_context ctx) {
-    return (ctx && ctx->batch_open) ? ctx->batch_count : 0;
+    return ctx ? ctx->since_flush : 0;   /* recorded since the last flush; some may have run */
 }
 
 int svk_has_device_address(svk_context ctx) {
@@ -1279,17 +1385,20 @@ static int svk_xfer_ensure(svk_context ctx, uint64_t size) {
 /* ----------------------------------------------------------------------------
  * Recorded uploads (0.5.0): the data is copied now into a host-visible arena chunk
  * and the copy to `buf' is recorded into the batch like any command, so nothing is
- * flushed; the arena is reset after the batch's fence. 64 chunks of at least 4 MB.
+ * flushed. Each slot has its own arena (0.7.0), reset once the slot's work has
+ * completed: up to SVK_ARENA_CHUNKS chunks of at least 4 MB.
  * ---------------------------------------------------------------------------- */
 
 #define SVK_ARENA_MIN (4ull * 1024ull * 1024ull)
 
+/* A chunk of the open slot's arena with `size' bytes free, or -1. */
 static int svk_arena_chunk(svk_context ctx, uint64_t size) {
-    for (uint32_t i = 0; i < ctx->arena_count; i++) {
-        if (ctx->arena_size[i] - ctx->arena_used[i] >= size) return (int) i;
+    struct svk_slot_t* s = &ctx->slots[ctx->slot_cur];
+    for (uint32_t i = 0; i < s->arena_count; i++) {
+        if (s->arena_size[i] - s->arena_used[i] >= size) return (int) i;
     }
-    if (ctx->arena_count == 64) return -1;
-    uint32_t k = ctx->arena_count;
+    if (s->arena_count == SVK_ARENA_CHUNKS) return -1;
+    uint32_t k = s->arena_count;
     uint64_t bytes = size > SVK_ARENA_MIN ? size : SVK_ARENA_MIN;
     VkBufferCreateInfo bi = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -1297,38 +1406,43 @@ static int svk_arena_chunk(svk_context ctx, uint64_t size) {
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
     };
-    if (vkCreateBuffer(ctx->device, &bi, NULL, &ctx->arena_buffer[k]) != VK_SUCCESS) return -1;
+    if (vkCreateBuffer(ctx->device, &bi, NULL, &s->arena_buffer[k]) != VK_SUCCESS) return -1;
     VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(ctx->device, ctx->arena_buffer[k], &req);
+    vkGetBufferMemoryRequirements(ctx->device, s->arena_buffer[k], &req);
     VkMemoryAllocateInfo ai = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = req.size,
         .memoryTypeIndex = find_memory_type(ctx->physical_device, req.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
     };
-    if (vkAllocateMemory(ctx->device, &ai, NULL, &ctx->arena_memory[k]) != VK_SUCCESS) {
-        vkDestroyBuffer(ctx->device, ctx->arena_buffer[k], NULL);
+    if (vkAllocateMemory(ctx->device, &ai, NULL, &s->arena_memory[k]) != VK_SUCCESS) {
+        vkDestroyBuffer(ctx->device, s->arena_buffer[k], NULL);
         return -1;
     }
-    vkBindBufferMemory(ctx->device, ctx->arena_buffer[k], ctx->arena_memory[k], 0);
-    if (vkMapMemory(ctx->device, ctx->arena_memory[k], 0, bytes, 0, &ctx->arena_mapped[k]) != VK_SUCCESS) return -1;
-    ctx->arena_size[k] = bytes;
-    ctx->arena_used[k] = 0;
-    ctx->arena_count = k + 1;
+    vkBindBufferMemory(ctx->device, s->arena_buffer[k], s->arena_memory[k], 0);
+    if (vkMapMemory(ctx->device, s->arena_memory[k], 0, bytes, 0, &s->arena_mapped[k]) != VK_SUCCESS) {
+        vkDestroyBuffer(ctx->device, s->arena_buffer[k], NULL);
+        vkFreeMemory(ctx->device, s->arena_memory[k], NULL);
+        return -1;
+    }
+    s->arena_size[k] = bytes;
+    s->arena_used[k] = 0;
+    s->arena_count = k + 1;
     return (int) k;
 }
 
 int svk_record_write(svk_context ctx, svk_buffer buf, const void* data, uint64_t size, uint64_t offset) {
     if (!ctx || !buf || !data || size == 0) return 0;
     if (offset + size > buf->size) return 0;
+    if (!svk_batch_ensure_open(ctx)) return 0;      /* first: the slot's arena is free only once open */
     int k = svk_arena_chunk(ctx, size);
     if (k < 0) return svk_write_buffer(ctx, buf, data, size, offset);   /* arena exhausted: the flushing path */
-    if (!svk_batch_ensure_open(ctx)) return 0;
-    uint64_t at = ctx->arena_used[k];
-    memcpy((char*) ctx->arena_mapped[k] + at, data, (size_t) size);
-    ctx->arena_used[k] = (at + size + 15u) & ~15ull;
+    struct svk_slot_t* s = &ctx->slots[ctx->slot_cur];
+    uint64_t at = s->arena_used[k];
+    memcpy((char*) s->arena_mapped[k] + at, data, (size_t) size);
+    s->arena_used[k] = (at + size + 15u) & ~15ull;
     VkBufferCopy region = { .srcOffset = at, .dstOffset = offset, .size = size };
-    vkCmdCopyBuffer(ctx->batch_cmd, ctx->arena_buffer[k], buf->buffer, 1, &region);
+    vkCmdCopyBuffer(ctx->batch_cmd, s->arena_buffer[k], buf->buffer, 1, &region);
     svk_batch_recorded(ctx);
     return 1;
 }
