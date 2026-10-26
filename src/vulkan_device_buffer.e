@@ -161,8 +161,10 @@ feature -- Disposal
 
 	recycle
 			-- Give the buffer to the context's pool for reuse by a later `make' of the same
-			-- size (0.3.0); beyond the pool limit it is freed (deferred). Safe at once and from
-			-- a collector's `dispose'. The contents are not kept.
+			-- size class (0.3.0; 0.8.0: a device buffer is allocated at its class, 256 bytes or
+			-- one of four per power of two, at most 25% over `size'); beyond the pool limit it
+			-- is freed (deferred). Safe at once and from a collector's `dispose'. The contents
+			-- are not kept.
 		do
 			if is_valid then
 				svk_recycle_buffer (context.handle, handle)

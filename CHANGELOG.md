@@ -1,5 +1,12 @@
 # Changelog: simple_vulkan
 
+## 0.8.0 (2026-10-26): device-buffer pool by size class
+- **Before:** the pool matched recycled buffers by exact size, with a linear scan. A decoder's attention buffers grow by one position per token, so nearly every size was new: the pool filled to its limit with sizes never asked for again, and then every new size went to the driver while each allocation scanned the whole stale list. Needle 3 decoding fell from about 72 ms to 1.2-1.7 s per token once the pool reached 8 GB.
+- **Now:** a device buffer is allocated at its size class: 256 bytes, then four classes per power of two (at most 25% over the request). The pool keeps one free list per class, so taking and recycling are O(1), and growing shapes reuse buffers.
+  - `VULKAN_DEVICE_BUFFER.size` stays the size asked for (bounds checks and descriptor ranges use it); the allocation behind it may be larger.
+  - `VULKAN_CONTEXT.pooled_bytes` counts allocated bytes. `set_pool_limit` and `trim_pool` free the largest classes first.
+- Test `pool_size_classes`. 19/19.
+
 ## 0.7.0 (2026-10-26): asynchronous submission
 - **Before:** recorded work ran only at a flush, which submitted and then waited. A training step's whole recording happened while the GPU sat idle, and then the host sat idle while the GPU ran it.
 - **Now:** recording uses a ring of 3 slots. Each slot has its own command buffer, fence, upload arena, deferred-free list and timestamp queries.

@@ -24,6 +24,7 @@
 #define SVK_SLOTS 3u
 #define SVK_SUBMIT_EVERY 128u
 #define SVK_ARENA_CHUNKS 16u
+#define SVK_POOL_CLASSES 160u      /* device-buffer size classes: 256 B, then 4 per power of two */
 
 struct svk_slot_t {
     VkCommandBuffer cmd;
@@ -79,9 +80,10 @@ struct svk_context_t {
     VkDeviceMemory xfer_memory;
     void* xfer_mapped;
     uint64_t xfer_size;
-    struct svk_buffer_t** pool;         /* recycled device buffers, matched by exact size */
-    uint32_t pool_count;
-    uint32_t pool_capacity;
+    /* Recycled device buffers (0.8.0): one free list per size class (svk_size_class) */
+    struct svk_buffer_t** pool[SVK_POOL_CLASSES];
+    uint32_t pool_count[SVK_POOL_CLASSES];
+    uint32_t pool_capacity[SVK_POOL_CLASSES];
     uint64_t pool_bytes;
     uint64_t pool_limit;
     uint64_t pool_hits;
@@ -97,7 +99,8 @@ struct svk_context_t {
 struct svk_buffer_t {
     VkBuffer buffer;
     VkDeviceMemory memory;
-    uint64_t size;
+    uint64_t size;          /* bytes asked for: bounds checks and descriptor ranges */
+    uint64_t capacity;      /* bytes allocated: the size class of a pooled device buffer, else size */
     uint32_t usage;
 };
 
@@ -408,12 +411,14 @@ void svk_cleanup(svk_context ctx) {
         vkDestroyBuffer(ctx->device, ctx->xfer_buffer, NULL);
         vkFreeMemory(ctx->device, ctx->xfer_memory, NULL);
     }
-    for (uint32_t i = 0; i < ctx->pool_count; i++) {
-        vkDestroyBuffer(ctx->device, ctx->pool[i]->buffer, NULL);
-        vkFreeMemory(ctx->device, ctx->pool[i]->memory, NULL);
-        free(ctx->pool[i]);
+    for (uint32_t c = 0; c < SVK_POOL_CLASSES; c++) {
+        for (uint32_t i = 0; i < ctx->pool_count[c]; i++) {
+            vkDestroyBuffer(ctx->device, ctx->pool[c][i]->buffer, NULL);
+            vkFreeMemory(ctx->device, ctx->pool[c][i]->memory, NULL);
+            free(ctx->pool[c][i]);
+        }
+        free(ctx->pool[c]);
     }
-    free(ctx->pool);
     for (uint32_t k = 0; k < SVK_SLOTS; k++) {     /* the flush above emptied every free list */
         struct svk_slot_t* s = &ctx->slots[k];
         if (s->fence) vkDestroyFence(ctx->device, s->fence, NULL);
@@ -451,6 +456,7 @@ svk_buffer svk_create_buffer(svk_context ctx, uint64_t size, uint32_t usage) {
     if (!buf) return NULL;
 
     buf->size = size;
+    buf->capacity = size;
     buf->usage = usage;
 
     VkBufferUsageFlags vk_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -1231,63 +1237,82 @@ int svk_has_cooperative_matrix_bf16(svk_context ctx) {
 }
 
 /* ----------------------------------------------------------------------------
- * Device-buffer pool (0.3.0). A recycled buffer is reusable at once: commands
- * run in recorded order with a full barrier after each, so its new first use
- * always follows its old last use. Matched by exact size (training repeats
- * shapes); bytes above pool_limit go back to the driver (deferred free).
+ * Device-buffer pool (0.3.0; size classes 0.8.0). A recycled buffer is reusable
+ * at once: commands run in recorded order with a barrier after each, so its new
+ * first use always follows its old last use. A device buffer is allocated at its
+ * size class (256 bytes, then four classes per power of two: at most 25% over
+ * the request), and the pool keeps one free list per class: taking and recycling
+ * are O(1), and shapes that grow a little each step (a decoder's attention over
+ * a longer sequence) reuse the same buffers instead of filling the pool with
+ * sizes never asked for again. Bytes above pool_limit go back to the driver
+ * (deferred free).
  * ---------------------------------------------------------------------------- */
 
 #define SVK_DEFAULT_POOL_LIMIT (1024ull * 1024ull * 1024ull)
 
-static svk_buffer svk_pool_take(svk_context ctx, uint64_t size) {
-    for (uint32_t i = ctx->pool_count; i > 0; i--) {
-        svk_buffer b = ctx->pool[i - 1];
-        if (b->size == size) {
-            ctx->pool[i - 1] = ctx->pool[ctx->pool_count - 1];
-            ctx->pool_count--;
-            ctx->pool_bytes -= size;
-            ctx->pool_hits++;
-            return b;
-        }
-    }
-    return NULL;
+/* The size class of `size' (its allocated bytes), and the class's free-list
+   index in `index' (SVK_POOL_CLASSES when too large to pool: then `size'). */
+static uint64_t svk_size_class(uint64_t size, uint32_t* index) {
+    if (size <= 256) { *index = 0; return 256; }
+    uint32_t k = 8;                                 /* 2^k < size <= 2^(k+1) */
+    while (k < 62 && (1ull << (k + 1)) < size) k++;
+    uint64_t base = 1ull << k, step = base >> 2;
+    uint64_t q = (size - base + step - 1) / step;   /* 1..4 */
+    uint32_t i = 1 + 4 * (k - 8) + (uint32_t) (q - 1);
+    if (i >= SVK_POOL_CLASSES) { *index = SVK_POOL_CLASSES; return size; }
+    *index = i;
+    return base + q * step;
+}
+
+static svk_buffer svk_pool_take(svk_context ctx, uint32_t index, uint64_t size) {
+    if (index >= SVK_POOL_CLASSES || ctx->pool_count[index] == 0) return NULL;
+    svk_buffer b = ctx->pool[index][--ctx->pool_count[index]];
+    ctx->pool_bytes -= b->capacity;
+    ctx->pool_hits++;
+    b->size = size;
+    return b;
 }
 
 void svk_recycle_buffer(svk_context ctx, svk_buffer buf) {
     if (!ctx || !buf) return;
     uint64_t limit = ctx->pool_limit ? ctx->pool_limit : SVK_DEFAULT_POOL_LIMIT;
-    if (!(buf->usage & SVK_BUFFER_DEVICE_LOCAL) || ctx->pool_bytes + buf->size > limit) {
+    uint32_t c;
+    if (!(buf->usage & SVK_BUFFER_DEVICE_LOCAL) || svk_size_class(buf->capacity, &c) != buf->capacity
+        || c >= SVK_POOL_CLASSES || ctx->pool_bytes + buf->capacity > limit) {
         svk_free_buffer_deferred(ctx, buf);
         return;
     }
-    if (ctx->pool_count == ctx->pool_capacity) {
-        uint32_t cap = ctx->pool_capacity ? 2 * ctx->pool_capacity : 256;
-        struct svk_buffer_t** grown = (struct svk_buffer_t**) realloc(ctx->pool, cap * sizeof(*grown));
+    if (ctx->pool_count[c] == ctx->pool_capacity[c]) {
+        uint32_t cap = ctx->pool_capacity[c] ? 2 * ctx->pool_capacity[c] : 16;
+        struct svk_buffer_t** grown = (struct svk_buffer_t**) realloc(ctx->pool[c], cap * sizeof(*grown));
         if (!grown) { svk_free_buffer_deferred(ctx, buf); return; }
-        ctx->pool = grown;
-        ctx->pool_capacity = cap;
+        ctx->pool[c] = grown;
+        ctx->pool_capacity[c] = cap;
     }
-    ctx->pool[ctx->pool_count++] = buf;
-    ctx->pool_bytes += buf->size;
+    ctx->pool[c][ctx->pool_count[c]++] = buf;
+    ctx->pool_bytes += buf->capacity;
+}
+
+/* Free pooled buffers, largest classes first, until at most `bytes' remain. */
+static void svk_pool_shrink(svk_context ctx, uint64_t bytes) {
+    for (uint32_t c = SVK_POOL_CLASSES; c > 0 && ctx->pool_bytes > bytes; c--) {
+        while (ctx->pool_count[c - 1] > 0 && ctx->pool_bytes > bytes) {
+            svk_buffer b = ctx->pool[c - 1][--ctx->pool_count[c - 1]];
+            ctx->pool_bytes -= b->capacity;
+            svk_free_buffer_deferred(ctx, b);
+        }
+    }
 }
 
 void svk_trim_pool(svk_context ctx) {
     if (!ctx) return;
-    while (ctx->pool_count > 0) {
-        svk_buffer b = ctx->pool[--ctx->pool_count];
-        ctx->pool_bytes -= b->size;
-        svk_free_buffer_deferred(ctx, b);
-    }
+    svk_pool_shrink(ctx, 0);
 }
 
 void svk_set_pool_limit(svk_context ctx, uint64_t bytes) {
     if (!ctx) return;
     ctx->pool_limit = bytes;
-    while (ctx->pool_count > 0 && ctx->pool_bytes > bytes) {
-        svk_buffer b = ctx->pool[--ctx->pool_count];
-        ctx->pool_bytes -= b->size;
-        svk_free_buffer_deferred(ctx, b);
-    }
+    svk_pool_shrink(ctx, bytes);
 }
 
 uint64_t svk_pool_bytes(svk_context ctx) { return ctx ? ctx->pool_bytes : 0; }
@@ -1296,17 +1321,20 @@ uint64_t svk_pool_hits(svk_context ctx) { return ctx ? ctx->pool_hits : 0; }
 svk_buffer svk_create_device_buffer(svk_context ctx, uint64_t size) {
     if (!ctx || size == 0 || !ctx->has_device_address) return NULL;
 
-    svk_buffer pooled = svk_pool_take(ctx, size);
+    uint32_t index;
+    uint64_t capacity = svk_size_class(size, &index);
+    svk_buffer pooled = svk_pool_take(ctx, index, size);
     if (pooled) return pooled;
 
     svk_buffer buf = (svk_buffer)calloc(1, sizeof(struct svk_buffer_t));
     if (!buf) return NULL;
     buf->size = size;
+    buf->capacity = capacity;
     buf->usage = SVK_BUFFER_STORAGE | SVK_BUFFER_TRANSFER | SVK_BUFFER_DEVICE_LOCAL;
 
     VkBufferCreateInfo buffer_info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = size,
+        .size = capacity,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                  VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE

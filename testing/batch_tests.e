@@ -36,6 +36,7 @@ feature -- Execution
 				check_that ("100 descriptor pipelines created and freed (pool holds 32)", descriptor_sets_returned)
 				check_that ("deferred release: queued while a batch is open, freed at flush", deferred_release)
 				check_that ("pool: recycled buffer reused by size, reuse ordered after old use, limit and trim", pool_reuse)
+				check_that ("pool size classes: 1,000 B recycled serves 1,020 B (class 1,024), not 1,100 B (class 1,280)", pool_size_classes)
 				check_that ("profiling: 200 dispatches timed on the GPU, none when off", profiling)
 				check_that ("recorded uploads: three payloads in one batch, no flush, all intact", recorded_uploads)
 				check_that ("async submission: 400 increments go out in slots while recording, in order; frees wait for them", async_submission)
@@ -274,6 +275,35 @@ feature {NONE} -- Tests
 				p.dispose
 			end
 			keep.dispose
+		end
+
+	pool_size_classes: BOOLEAN
+			-- Device buffers are allocated at their size class (four per power of two), so a
+			-- recycled buffer serves any later request of the same class, at the size asked for;
+			-- a request of another class allocates fresh.
+		local
+			a, b, c: VULKAN_DEVICE_BUFFER
+			l_host: MANAGED_POINTER
+			l_hits: INTEGER_64
+		do
+			ctx.trim_pool
+			ctx.flush
+			create l_host.make (1020)
+			l_hits := ctx.pool_hits
+			create a.make (ctx, 1000)
+			a.recycle
+			Result := ctx.pooled_bytes = 1024
+			create b.make (ctx, 1020)
+			Result := Result and ctx.pool_hits = l_hits + 1 and ctx.pooled_bytes = 0 and b.size = 1020
+			Result := Result and b.record_fill (0, 1020, 0x40A00000) and b.read (l_host.item, 1020, 0)
+				and l_host.read_real_32 (0) = 5.0 and l_host.read_real_32 (1016) = 5.0
+			b.recycle
+			create c.make (ctx, 1100)
+			Result := Result and ctx.pool_hits = l_hits + 1 and ctx.pooled_bytes = 1024
+			c.recycle
+			Result := Result and ctx.pooled_bytes = 1024 + 1280
+			ctx.trim_pool
+			Result := Result and ctx.pooled_bytes = 0
 		end
 
 	recorded_uploads: BOOLEAN

@@ -236,7 +236,8 @@ feature -- Profiling (0.4.0)
 feature -- Device-buffer pool (0.3.0)
 
 	pooled_bytes: INTEGER_64
-			-- Bytes held by recycled device buffers awaiting reuse.
+			-- Bytes held by recycled device buffers awaiting reuse (allocated bytes: each
+			-- buffer's size class).
 		require
 			valid: is_valid
 		do
