@@ -162,6 +162,8 @@ int svk_record_copy(svk_context ctx, svk_buffer src, uint64_t src_offset, svk_bu
 int svk_record_fill(svk_context ctx, svk_buffer buf, uint64_t offset, uint64_t size, uint32_t value);
 int svk_flush(svk_context ctx);
 uint32_t svk_pending_commands(svk_context ctx);
+void svk_free_buffer_deferred(svk_context ctx, svk_buffer buf);  /* safe while a batch is open (from a collector) */
+uint32_t svk_queued_frees(svk_context ctx);
 
 /* Free pipeline */
 void svk_free_pipeline(svk_context ctx, svk_pipeline pipe);

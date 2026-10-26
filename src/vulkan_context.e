@@ -161,6 +161,14 @@ feature -- Compute batches (0.2.0)
 	last_flush_succeeded: BOOLEAN
 			-- Did the last `flush' submit and complete?
 
+	queued_frees: INTEGER
+			-- Device buffers released while a batch was open, freed at the next flush.
+		require
+			valid: is_valid
+		do
+			Result := svk_queued_frees (handle).to_integer_32
+		end
+
 feature -- Disposal
 
 	dispose
@@ -232,6 +240,13 @@ feature {NONE} -- C Externals
 			"C inline use <simple_vulkan.h>"
 		alias
 			"return svk_pending_commands((svk_context)$ctx);"
+		end
+
+	svk_queued_frees (ctx: POINTER): NATURAL_32
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return svk_queued_frees((svk_context)$ctx);"
 		end
 
 	svk_flush (ctx: POINTER): INTEGER

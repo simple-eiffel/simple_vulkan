@@ -47,6 +47,9 @@ struct svk_context_t {
     VkDeviceMemory xfer_memory;
     void* xfer_mapped;
     uint64_t xfer_size;
+    struct svk_buffer_t** free_queue;   /* buffers freed while a batch was open */
+    uint32_t free_count;
+    uint32_t free_capacity;
 };
 
 struct svk_buffer_t {
@@ -295,6 +298,7 @@ void svk_cleanup(svk_context ctx) {
         vkFreeMemory(ctx->device, ctx->xfer_memory, NULL);
     }
     if (ctx->batch_fence) vkDestroyFence(ctx->device, ctx->batch_fence, NULL);
+    free(ctx->free_queue);
 
     if (ctx->staging_buffer) {
         vkDestroyBuffer(ctx->device, ctx->staging_buffer, NULL);
@@ -865,6 +869,8 @@ int svk_download_image(svk_context ctx, svk_image img, void* data) {
 #define SVK_BATCH_AUTO_FLUSH 16384u
 #define SVK_XFER_CHUNK (64ull * 1024ull * 1024ull)
 
+static void svk_drain_free_queue(svk_context ctx);
+
 static int svk_batch_ensure_open(svk_context ctx) {
     if (ctx->batch_open) return 1;
     if (!ctx->batch_cmd) {
@@ -921,7 +927,43 @@ int svk_flush(svk_context ctx) {
     vkResetFences(ctx->device, 1, &ctx->batch_fence);
     vkResetCommandBuffer(ctx->batch_cmd, 0);
     ctx->batch_count = 0;
+    svk_drain_free_queue(ctx);
     return waited == VK_SUCCESS;
+}
+
+static void svk_destroy_buffer_now(svk_context ctx, svk_buffer buf) {
+    vkDestroyBuffer(ctx->device, buf->buffer, NULL);
+    vkFreeMemory(ctx->device, buf->memory, NULL);
+    free(buf);
+}
+
+static void svk_drain_free_queue(svk_context ctx) {
+    for (uint32_t i = 0; i < ctx->free_count; i++) svk_destroy_buffer_now(ctx, ctx->free_queue[i]);
+    ctx->free_count = 0;
+}
+
+void svk_free_buffer_deferred(svk_context ctx, svk_buffer buf) {
+    if (!ctx || !buf) return;
+    if (!ctx->batch_open) {
+        svk_destroy_buffer_now(ctx, buf);
+        return;
+    }
+    if (ctx->free_count == ctx->free_capacity) {
+        uint32_t cap = ctx->free_capacity ? 2 * ctx->free_capacity : 64;
+        struct svk_buffer_t** grown = (struct svk_buffer_t**) realloc(ctx->free_queue, cap * sizeof(*grown));
+        if (!grown) {                     /* cannot queue: run the batch, then free */
+            svk_flush(ctx);
+            svk_destroy_buffer_now(ctx, buf);
+            return;
+        }
+        ctx->free_queue = grown;
+        ctx->free_capacity = cap;
+    }
+    ctx->free_queue[ctx->free_count++] = buf;
+}
+
+uint32_t svk_queued_frees(svk_context ctx) {
+    return ctx ? ctx->free_count : 0;
 }
 
 uint32_t svk_pending_commands(svk_context ctx) {

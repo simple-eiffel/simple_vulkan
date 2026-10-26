@@ -34,6 +34,7 @@ feature -- Execution
 				check_that ("1,000 dependent dispatches in one batch run in order", batched_increments)
 				check_that ("recorded copy between device buffers", recorded_copy)
 				check_that ("100 descriptor pipelines created and freed (pool holds 32)", descriptor_sets_returned)
+				check_that ("deferred release: queued while a batch is open, freed at flush", deferred_release)
 			else
 				print ("Test: compute batches... SKIP (no device addresses)%N")
 			end
@@ -189,6 +190,36 @@ feature {NONE} -- Tests
 				buf.dispose
 				s.dispose
 			end
+		end
+
+	deferred_release: BOOLEAN
+			-- A buffer released while a recorded dispatch still writes it is queued, the
+			-- dispatch still runs (the result copied out lands), and the flush frees it.
+		local
+			x, keep: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_push, l_host: MANAGED_POINTER
+		do
+			create x.make (ctx, 1024)
+			create keep.make (ctx, 1024)
+			create l_host.make (1024)
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (x.address, 0)
+				l_push.put_natural_32 (256, 8)
+				Result := x.record_fill (0, 1024, 0) and p.record (l_push.item, 12, 1, 1, 1)
+					and x.record_copy_to (keep, 0, 0, 1024)
+				x.release_deferred
+				Result := Result and not x.is_valid and ctx.queued_frees = 1
+				ctx.flush
+				Result := Result and ctx.queued_frees = 0 and keep.read (l_host.item, 1024, 0)
+					and l_host.read_real_32 (0) = 1.0 and l_host.read_real_32 (1020) = 1.0
+				x.release_deferred
+				Result := Result and ctx.queued_frees = 0
+				p.dispose
+			end
+			keep.dispose
 		end
 
 feature {NONE} -- Helpers

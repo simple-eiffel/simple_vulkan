@@ -132,7 +132,28 @@ feature -- Disposal
 			disposed: not is_valid and handle = default_pointer
 		end
 
+	release_deferred
+			-- Free the GPU memory without waiting: now when no batch is open, else
+			-- after the next flush's fence. Safe from a garbage collector's `dispose'.
+		do
+			if is_valid then
+				svk_free_buffer_deferred (context.handle, handle)
+				handle := default_pointer
+				is_valid := False
+				address := 0
+			end
+		ensure
+			released: not is_valid and handle = default_pointer
+		end
+
 feature {NONE} -- C externals
+
+	svk_free_buffer_deferred (ctx, buf: POINTER)
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"svk_free_buffer_deferred((svk_context)$ctx, (svk_buffer)$buf);"
+		end
 
 	svk_create_device_buffer (ctx: POINTER; a_size: NATURAL_64): POINTER
 		external
