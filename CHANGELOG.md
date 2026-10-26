@@ -1,5 +1,10 @@
 # Changelog: simple_vulkan
 
+## 0.4.0 (2026-10-26): GPU profiling
+- `VULKAN_CONTEXT.set_profiling`: with profiling on, every recorded dispatch is bracketed by GPU timestamps (a query pool sized for a full batch), and each flush adds the elapsed time to its pipeline.
+- `VULKAN_ADDRESS_PIPELINE`: `profiled_ms`, `profiled_calls`, `reset_profile`.
+- Test: 200 timed dispatches give 200 calls and a positive GPU time; dispatches recorded with profiling off add nothing. 15/15.
+
 ## 0.3.0 (2026-10-26): device-buffer pool
 - `VULKAN_DEVICE_BUFFER.recycle` hands a buffer to the context's pool, and the next `make` of the same byte size reuses it, skipping the driver allocation. Reuse is safe at once: commands run in recorded order with a barrier after each, so the new first use follows the old last use. `recycle` is safe from a garbage collector's `dispose`.
 - `VULKAN_CONTEXT`: `pooled_bytes`, `pool_hits`, `set_pool_limit` (default 1 GiB; bytes beyond it are freed, deferred) and `trim_pool`.

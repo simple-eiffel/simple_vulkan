@@ -172,6 +172,13 @@ void svk_trim_pool(svk_context ctx);
 void svk_set_pool_limit(svk_context ctx, uint64_t bytes);
 uint64_t svk_pool_bytes(svk_context ctx);
 uint64_t svk_pool_hits(svk_context ctx);
+
+/* Profiling (0.4.0): with profiling on, each recorded dispatch is bracketed by GPU
+   timestamps; at every flush the elapsed time is added to its pipeline. */
+int svk_set_profiling(svk_context ctx, int on);
+uint64_t svk_pipeline_profiled_ns(svk_pipeline pipe);
+uint64_t svk_pipeline_profiled_calls(svk_pipeline pipe);
+void svk_pipeline_reset_profile(svk_pipeline pipe);
 uint32_t svk_queued_frees(svk_context ctx);
 
 /* Free pipeline */

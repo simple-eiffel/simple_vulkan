@@ -169,6 +169,24 @@ feature -- Compute batches (0.2.0)
 			Result := svk_queued_frees (handle).to_integer_32
 		end
 
+feature -- Profiling (0.4.0)
+
+	is_profiling: BOOLEAN
+			-- Are recorded dispatches being timed on the GPU?
+
+	set_profiling (a_on: BOOLEAN)
+			-- Time every recorded dispatch (GPU timestamps before and after) and add the
+			-- elapsed time to its pipeline at each flush. Runs any open batch first.
+		require
+			valid: is_valid
+		do
+			if svk_set_profiling (handle, a_on.to_integer) /= 0 then
+				is_profiling := a_on
+			end
+		ensure
+			nothing_pending: pending_commands = 0
+		end
+
 feature -- Device-buffer pool (0.3.0)
 
 	pooled_bytes: INTEGER_64
@@ -279,6 +297,13 @@ feature {NONE} -- C Externals
 			"C inline use <simple_vulkan.h>"
 		alias
 			"return svk_pending_commands((svk_context)$ctx);"
+		end
+
+	svk_set_profiling (ctx: POINTER; a_on: INTEGER): INTEGER
+		external
+			"C blocking inline use <simple_vulkan.h>"
+		alias
+			"return svk_set_profiling((svk_context)$ctx, (int)$a_on);"
 		end
 
 	svk_pool_bytes (ctx: POINTER): NATURAL_64

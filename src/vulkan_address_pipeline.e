@@ -61,6 +61,33 @@ feature -- Recording
 				a_groups_x.to_natural_32, a_groups_y.to_natural_32, a_groups_z.to_natural_32) /= 0
 		end
 
+feature -- Profiling (0.4.0)
+
+	profiled_ms: REAL_64
+			-- GPU time of this pipeline's dispatches recorded while profiling was on.
+		require
+			valid: is_valid
+		do
+			Result := svk_pipeline_profiled_ns (handle).to_real_64 / 1.0e6
+		end
+
+	profiled_calls: INTEGER_64
+			-- Dispatches timed.
+		require
+			valid: is_valid
+		do
+			Result := svk_pipeline_profiled_calls (handle).to_integer_64
+		end
+
+	reset_profile
+		require
+			valid: is_valid
+		do
+			svk_pipeline_reset_profile (handle)
+		ensure
+			cleared: profiled_calls = 0
+		end
+
 feature -- Disposal
 
 	dispose
@@ -89,6 +116,27 @@ feature {NONE} -- C externals
 			"C blocking inline use <simple_vulkan.h>"
 		alias
 			"return svk_record_dispatch((svk_context)$ctx, (svk_pipeline)$pipe, $push, (uint32_t)$a_push_size, (uint32_t)$x, (uint32_t)$y, (uint32_t)$z);"
+		end
+
+	svk_pipeline_profiled_ns (pipe: POINTER): NATURAL_64
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return (EIF_NATURAL_64) svk_pipeline_profiled_ns((svk_pipeline)$pipe);"
+		end
+
+	svk_pipeline_profiled_calls (pipe: POINTER): NATURAL_64
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return (EIF_NATURAL_64) svk_pipeline_profiled_calls((svk_pipeline)$pipe);"
+		end
+
+	svk_pipeline_reset_profile (pipe: POINTER)
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"svk_pipeline_reset_profile((svk_pipeline)$pipe);"
 		end
 
 	svk_free_pipeline (ctx, pipe: POINTER)

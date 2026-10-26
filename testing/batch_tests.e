@@ -36,6 +36,7 @@ feature -- Execution
 				check_that ("100 descriptor pipelines created and freed (pool holds 32)", descriptor_sets_returned)
 				check_that ("deferred release: queued while a batch is open, freed at flush", deferred_release)
 				check_that ("pool: recycled buffer reused by size, reuse ordered after old use, limit and trim", pool_reuse)
+				check_that ("profiling: 200 dispatches timed on the GPU, none when off", profiling)
 			else
 				print ("Test: compute batches... SKIP (no device addresses)%N")
 			end
@@ -266,6 +267,47 @@ feature {NONE} -- Tests
 				p.dispose
 			end
 			keep.dispose
+		end
+
+	profiling: BOOLEAN
+			-- 200 timed increments over 4M floats: 200 calls and a positive GPU time; with
+			-- profiling off, 50 more dispatches add nothing.
+		local
+			x: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_push: MANAGED_POINTER
+			i, n: INTEGER
+			l_ms: REAL_64
+		do
+			n := 4 * 1024 * 1024
+			create x.make (ctx, n * 4)
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (x.address, 0)
+				l_push.put_natural_32 (n.to_natural_32, 8)
+				ctx.set_profiling (True)
+				Result := ctx.is_profiling
+				from i := 1 until not Result or i > 200 loop
+					Result := p.record (l_push.item, 12, n // 256, 1, 1)
+					i := i + 1
+				end
+				ctx.flush
+				l_ms := p.profiled_ms
+				print ("(200 dispatches: " + l_ms.out + " ms GPU) ")
+				Result := Result and p.profiled_calls = 200 and l_ms > 0.0
+				ctx.set_profiling (False)
+				from i := 1 until not Result or i > 50 loop
+					Result := p.record (l_push.item, 12, n // 256, 1, 1)
+					i := i + 1
+				end
+				ctx.flush
+				Result := Result and p.profiled_calls = 200
+				p.reset_profile
+				Result := Result and p.profiled_calls = 0
+				p.dispose
+			end
+			x.dispose
 		end
 
 feature {NONE} -- Helpers

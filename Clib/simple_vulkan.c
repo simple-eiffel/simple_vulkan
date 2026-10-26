@@ -56,6 +56,12 @@ struct svk_context_t {
     uint64_t pool_bytes;
     uint64_t pool_limit;
     uint64_t pool_hits;
+    /* Profiling (0.4.0): a timestamp before and after each recorded dispatch */
+    int profiling;
+    VkQueryPool query_pool;
+    struct svk_pipeline_t** prof_pipes;
+    uint32_t prof_count;
+    double timestamp_period;   /* ns per tick */
 };
 
 struct svk_buffer_t {
@@ -79,6 +85,8 @@ struct svk_shader_t {
 };
 
 struct svk_pipeline_t {
+    uint64_t prof_ns;          /* GPU time across profiled dispatches */
+    uint64_t prof_calls;
     VkPipeline pipeline;
     VkPipelineLayout layout;
     VkDescriptorSetLayout desc_layout;
@@ -192,6 +200,7 @@ svk_context svk_init(void) {
             ctx->vendor_id = props.vendorID;
             ctx->is_discrete = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
             ctx->max_workgroup_size = props.limits.maxComputeWorkGroupInvocations;
+            ctx->timestamp_period = props.limits.timestampPeriod;
         }
     }
     free(devices);
@@ -311,6 +320,8 @@ void svk_cleanup(svk_context ctx) {
         free(ctx->pool[i]);
     }
     free(ctx->pool);
+    if (ctx->query_pool) vkDestroyQueryPool(ctx->device, ctx->query_pool, NULL);
+    free(ctx->prof_pipes);
 
     if (ctx->staging_buffer) {
         vkDestroyBuffer(ctx->device, ctx->staging_buffer, NULL);
@@ -901,6 +912,8 @@ static int svk_batch_ensure_open(svk_context ctx) {
     if (vkBeginCommandBuffer(ctx->batch_cmd, &begin_info) != VK_SUCCESS) return 0;
     ctx->batch_open = 1;
     ctx->batch_count = 0;
+    ctx->prof_count = 0;
+    if (ctx->profiling) vkCmdResetQueryPool(ctx->batch_cmd, ctx->query_pool, 0, 2 * SVK_BATCH_AUTO_FLUSH);
     return 1;
 }
 
@@ -939,9 +952,46 @@ int svk_flush(svk_context ctx) {
     vkResetFences(ctx->device, 1, &ctx->batch_fence);
     vkResetCommandBuffer(ctx->batch_cmd, 0);
     ctx->batch_count = 0;
+    if (ctx->profiling && ctx->prof_count > 0) {
+        uint64_t* stamps = (uint64_t*) malloc(sizeof(uint64_t) * 2 * ctx->prof_count);
+        if (stamps && vkGetQueryPoolResults(ctx->device, ctx->query_pool, 0, 2 * ctx->prof_count,
+                sizeof(uint64_t) * 2 * ctx->prof_count, stamps, sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+            for (uint32_t i = 0; i < ctx->prof_count; i++) {
+                svk_pipeline p = ctx->prof_pipes[i];
+                if (p && stamps[2 * i + 1] >= stamps[2 * i]) {
+                    p->prof_ns += (uint64_t) ((double) (stamps[2 * i + 1] - stamps[2 * i]) * ctx->timestamp_period);
+                    p->prof_calls++;
+                }
+            }
+        }
+        free(stamps);
+    }
+    ctx->prof_count = 0;
     svk_drain_free_queue(ctx);
     return waited == VK_SUCCESS;
 }
+
+int svk_set_profiling(svk_context ctx, int on) {
+    if (!ctx) return 0;
+    if (on && !ctx->query_pool) {
+        VkQueryPoolCreateInfo qi = {
+            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = 2 * SVK_BATCH_AUTO_FLUSH
+        };
+        if (vkCreateQueryPool(ctx->device, &qi, NULL, &ctx->query_pool) != VK_SUCCESS) return 0;
+        ctx->prof_pipes = (struct svk_pipeline_t**) calloc(SVK_BATCH_AUTO_FLUSH, sizeof(struct svk_pipeline_t*));
+        if (!ctx->prof_pipes) return 0;
+    }
+    svk_flush(ctx);   /* a batch is profiled whole or not at all */
+    ctx->profiling = on ? 1 : 0;
+    return 1;
+}
+
+uint64_t svk_pipeline_profiled_ns(svk_pipeline pipe) { return pipe ? pipe->prof_ns : 0; }
+uint64_t svk_pipeline_profiled_calls(svk_pipeline pipe) { return pipe ? pipe->prof_calls : 0; }
+void svk_pipeline_reset_profile(svk_pipeline pipe) { if (pipe) { pipe->prof_ns = 0; pipe->prof_calls = 0; } }
 
 static void svk_destroy_buffer_now(svk_context ctx, svk_buffer buf) {
     vkDestroyBuffer(ctx->device, buf->buffer, NULL);
@@ -1246,7 +1296,15 @@ int svk_record_dispatch(svk_context ctx, svk_pipeline pipe, const void* push, ui
     if (push_size > 0) {
         vkCmdPushConstants(ctx->batch_cmd, pipe->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
     }
+    if (ctx->profiling) {
+        ctx->prof_pipes[ctx->prof_count] = pipe;
+        vkCmdWriteTimestamp(ctx->batch_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx->query_pool, 2 * ctx->prof_count);
+    }
     vkCmdDispatch(ctx->batch_cmd, x, y, z);
+    if (ctx->profiling) {
+        vkCmdWriteTimestamp(ctx->batch_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->query_pool, 2 * ctx->prof_count + 1);
+        ctx->prof_count++;
+    }
     svk_batch_recorded(ctx);
     return 1;
 }
