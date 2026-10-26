@@ -16,7 +16,7 @@ Part of the [Simple Eiffel](https://github.com/simple-eiffel) ecosystem.
 
 ## Status
 
-**Production** - 15 tests passing (8 for compute batches, the pool and profiling, added in 0.2.0), supports NVIDIA, AMD, and Intel GPUs
+**Production** - 16 tests passing (9 for compute batches, the pool, profiling and recorded uploads, added in 0.2.0), supports NVIDIA, AMD, and Intel GPUs
 
 ## Overview
 

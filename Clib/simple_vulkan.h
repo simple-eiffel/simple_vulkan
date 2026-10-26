@@ -179,6 +179,10 @@ int svk_set_profiling(svk_context ctx, int on);
 uint64_t svk_pipeline_profiled_ns(svk_pipeline pipe);
 uint64_t svk_pipeline_profiled_calls(svk_pipeline pipe);
 void svk_pipeline_reset_profile(svk_pipeline pipe);
+
+/* Recorded uploads (0.5.0): copy `size' bytes into a per-batch host arena now and record the
+   copy to `buf'; nothing is flushed. Falls back to svk_write_buffer when the arena is full. */
+int svk_record_write(svk_context ctx, svk_buffer buf, const void* data, uint64_t size, uint64_t offset);
 uint32_t svk_queued_frees(svk_context ctx);
 
 /* Free pipeline */

@@ -1,5 +1,9 @@
 # Changelog: simple_vulkan
 
+## 0.5.0 (2026-10-26): recorded uploads
+- `VULKAN_DEVICE_BUFFER.record_write`: copies host data into a per-batch upload arena now and records its copy into the batch, ordered with the other commands, without flushing. The arena has up to 64 host-visible chunks of at least 4 MB and is reset after each flush's fence; if it is full, the call falls back to `write`. Small per-step uploads (token ids, targets, gather layouts) no longer drain the GPU.
+- Test: three payloads (two small, one of 8 MB) recorded into one batch, with the host buffer reused between them, and a dispatch reading one; nothing flushes until the read, and every buffer holds its own payload. 16/16.
+
 ## 0.4.0 (2026-10-26): GPU profiling
 - `VULKAN_CONTEXT.set_profiling`: with profiling on, every recorded dispatch is bracketed by GPU timestamps (a query pool sized for a full batch), and each flush adds the elapsed time to its pipeline.
 - `VULKAN_ADDRESS_PIPELINE`: `profiled_ms`, `profiled_calls`, `reset_profile`.

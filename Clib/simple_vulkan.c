@@ -56,6 +56,13 @@ struct svk_context_t {
     uint64_t pool_bytes;
     uint64_t pool_limit;
     uint64_t pool_hits;
+    /* Recorded uploads (0.5.0): host-visible arena chunks, reset after each flush */
+    VkBuffer arena_buffer[64];
+    VkDeviceMemory arena_memory[64];
+    void* arena_mapped[64];
+    uint64_t arena_size[64];
+    uint64_t arena_used[64];
+    uint32_t arena_count;
     /* Profiling (0.4.0): a timestamp before and after each recorded dispatch */
     int profiling;
     VkQueryPool query_pool;
@@ -322,6 +329,11 @@ void svk_cleanup(svk_context ctx) {
     free(ctx->pool);
     if (ctx->query_pool) vkDestroyQueryPool(ctx->device, ctx->query_pool, NULL);
     free(ctx->prof_pipes);
+    for (uint32_t i = 0; i < ctx->arena_count; i++) {
+        vkUnmapMemory(ctx->device, ctx->arena_memory[i]);
+        vkDestroyBuffer(ctx->device, ctx->arena_buffer[i], NULL);
+        vkFreeMemory(ctx->device, ctx->arena_memory[i], NULL);
+    }
 
     if (ctx->staging_buffer) {
         vkDestroyBuffer(ctx->device, ctx->staging_buffer, NULL);
@@ -968,6 +980,7 @@ int svk_flush(svk_context ctx) {
         free(stamps);
     }
     ctx->prof_count = 0;
+    for (uint32_t i = 0; i < ctx->arena_count; i++) ctx->arena_used[i] = 0;   /* the batch has consumed its uploads */
     svk_drain_free_queue(ctx);
     return waited == VK_SUCCESS;
 }
@@ -1185,6 +1198,63 @@ static int svk_xfer_ensure(svk_context ctx, uint64_t size) {
     vkBindBufferMemory(ctx->device, ctx->xfer_buffer, ctx->xfer_memory, 0);
     if (vkMapMemory(ctx->device, ctx->xfer_memory, 0, size, 0, &ctx->xfer_mapped) != VK_SUCCESS) return 0;
     ctx->xfer_size = size;
+    return 1;
+}
+
+/* ----------------------------------------------------------------------------
+ * Recorded uploads (0.5.0): the data is copied now into a host-visible arena chunk
+ * and the copy to `buf' is recorded into the batch like any command, so nothing is
+ * flushed; the arena is reset after the batch's fence. 64 chunks of at least 4 MB.
+ * ---------------------------------------------------------------------------- */
+
+#define SVK_ARENA_MIN (4ull * 1024ull * 1024ull)
+
+static int svk_arena_chunk(svk_context ctx, uint64_t size) {
+    for (uint32_t i = 0; i < ctx->arena_count; i++) {
+        if (ctx->arena_size[i] - ctx->arena_used[i] >= size) return (int) i;
+    }
+    if (ctx->arena_count == 64) return -1;
+    uint32_t k = ctx->arena_count;
+    uint64_t bytes = size > SVK_ARENA_MIN ? size : SVK_ARENA_MIN;
+    VkBufferCreateInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (vkCreateBuffer(ctx->device, &bi, NULL, &ctx->arena_buffer[k]) != VK_SUCCESS) return -1;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(ctx->device, ctx->arena_buffer[k], &req);
+    VkMemoryAllocateInfo ai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = find_memory_type(ctx->physical_device, req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    };
+    if (vkAllocateMemory(ctx->device, &ai, NULL, &ctx->arena_memory[k]) != VK_SUCCESS) {
+        vkDestroyBuffer(ctx->device, ctx->arena_buffer[k], NULL);
+        return -1;
+    }
+    vkBindBufferMemory(ctx->device, ctx->arena_buffer[k], ctx->arena_memory[k], 0);
+    if (vkMapMemory(ctx->device, ctx->arena_memory[k], 0, bytes, 0, &ctx->arena_mapped[k]) != VK_SUCCESS) return -1;
+    ctx->arena_size[k] = bytes;
+    ctx->arena_used[k] = 0;
+    ctx->arena_count = k + 1;
+    return (int) k;
+}
+
+int svk_record_write(svk_context ctx, svk_buffer buf, const void* data, uint64_t size, uint64_t offset) {
+    if (!ctx || !buf || !data || size == 0) return 0;
+    if (offset + size > buf->size) return 0;
+    int k = svk_arena_chunk(ctx, size);
+    if (k < 0) return svk_write_buffer(ctx, buf, data, size, offset);   /* arena exhausted: the flushing path */
+    if (!svk_batch_ensure_open(ctx)) return 0;
+    uint64_t at = ctx->arena_used[k];
+    memcpy((char*) ctx->arena_mapped[k] + at, data, (size_t) size);
+    ctx->arena_used[k] = (at + size + 15u) & ~15ull;
+    VkBufferCopy region = { .srcOffset = at, .dstOffset = offset, .size = size };
+    vkCmdCopyBuffer(ctx->batch_cmd, ctx->arena_buffer[k], buf->buffer, 1, &region);
+    svk_batch_recorded(ctx);
     return 1;
 }
 

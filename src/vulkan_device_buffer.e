@@ -92,6 +92,19 @@ feature -- Transfer (run all recorded work first)
 
 feature -- Recording (runs at the next flush)
 
+	record_write (a_data: POINTER; a_size, a_offset: INTEGER_64): BOOLEAN
+			-- Copy `a_size' bytes from host memory `a_data' into a per-batch upload arena now and
+			-- record their copy to byte `a_offset' (0.5.0): ordered with the other recorded
+			-- commands, without flushing. `a_data' may be reused as soon as this returns.
+		require
+			valid: is_valid
+			data_attached: a_data /= default_pointer
+			positive_size: a_size > 0
+			in_range: a_offset >= 0 and then a_offset + a_size <= size
+		do
+			Result := svk_record_write (context.handle, handle, a_data, a_size.to_natural_64, a_offset.to_natural_64) /= 0
+		end
+
 	record_copy_to (a_target: VULKAN_DEVICE_BUFFER; a_source_offset, a_target_offset, a_size: INTEGER_64): BOOLEAN
 			-- Record a copy of `a_size' bytes into `a_target'.
 		require
@@ -203,6 +216,13 @@ feature {NONE} -- C externals
 			"C blocking inline use <simple_vulkan.h>"
 		alias
 			"return svk_read_buffer((svk_context)$ctx, (svk_buffer)$buf, $data, (uint64_t)$a_size, (uint64_t)$a_offset);"
+		end
+
+	svk_record_write (ctx, buf, data: POINTER; a_size, a_offset: NATURAL_64): INTEGER
+		external
+			"C blocking inline use <simple_vulkan.h>"
+		alias
+			"return svk_record_write((svk_context)$ctx, (svk_buffer)$buf, $data, (uint64_t)$a_size, (uint64_t)$a_offset);"
 		end
 
 	svk_record_copy (ctx, src: POINTER; a_src_offset: NATURAL_64; dst: POINTER; a_dst_offset, a_size: NATURAL_64): INTEGER

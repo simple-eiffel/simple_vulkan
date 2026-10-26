@@ -37,6 +37,7 @@ feature -- Execution
 				check_that ("deferred release: queued while a batch is open, freed at flush", deferred_release)
 				check_that ("pool: recycled buffer reused by size, reuse ordered after old use, limit and trim", pool_reuse)
 				check_that ("profiling: 200 dispatches timed on the GPU, none when off", profiling)
+				check_that ("recorded uploads: three payloads in one batch, no flush, all intact", recorded_uploads)
 			else
 				print ("Test: compute batches... SKIP (no device addresses)%N")
 			end
@@ -267,6 +268,43 @@ feature {NONE} -- Tests
 				p.dispose
 			end
 			keep.dispose
+		end
+
+	recorded_uploads: BOOLEAN
+			-- Two small payloads and one of 8 MB (beyond an arena chunk) recorded into one batch,
+			-- the host buffer overwritten between them, then an increment over the first:
+			-- nothing flushes until the read, and every buffer holds its own payload.
+		local
+			a, b, c: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_host, l_big, l_push: MANAGED_POINTER
+			i, n_big: INTEGER
+		do
+			ctx.flush
+			n_big := 2 * 1024 * 1024
+			create a.make (ctx, 1024); create b.make (ctx, 1024); create c.make (ctx, n_big * 4)
+			create l_host.make (1024)
+			create l_big.make (n_big * 4)
+			from i := 0 until i = 256 loop l_host.put_real_32 (1.0, i * 4); i := i + 1 end
+			Result := a.record_write (l_host.item, 1024, 0)
+			from i := 0 until i = 256 loop l_host.put_real_32 (7.0, i * 4); i := i + 1 end
+			Result := Result and b.record_write (l_host.item, 1024, 0)
+			from i := 0 until i = n_big loop l_big.put_real_32 (i.to_real, i * 4); i := i + 1 end
+			Result := Result and c.record_write (l_big.item, n_big * 4, 0)
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (a.address, 0)
+				l_push.put_natural_32 (256, 8)
+				Result := Result and p.record (l_push.item, 12, 1, 1, 1)
+				Result := Result and ctx.pending_commands = 4
+				Result := Result and a.read (l_host.item, 1024, 0) and l_host.read_real_32 (0) = 2.0 and l_host.read_real_32 (1020) = 2.0
+				Result := Result and b.read (l_host.item, 1024, 0) and l_host.read_real_32 (0) = 7.0 and l_host.read_real_32 (1020) = 7.0
+				Result := Result and c.read (l_big.item, n_big * 4, 0) and l_big.read_real_32 (4) = 1.0
+					and l_big.read_real_32 ((n_big - 1) * 4) = (n_big - 1).to_real
+				p.dispose
+			end
+			a.dispose; b.dispose; c.dispose
 		end
 
 	profiling: BOOLEAN
