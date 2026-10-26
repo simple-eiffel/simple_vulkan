@@ -35,6 +35,18 @@ struct svk_context_t {
     VkBuffer staging_buffer;
     VkDeviceMemory staging_memory;
     uint64_t staging_size;
+
+    /* Compute batches (0.2.0): device-local buffers addressed from shaders,
+       dispatches recorded into one command buffer, submitted at a flush. */
+    int has_device_address;
+    VkCommandBuffer batch_cmd;
+    int batch_open;
+    uint32_t batch_count;
+    VkFence batch_fence;
+    VkBuffer xfer_buffer;          /* host-visible staging for device-local transfers */
+    VkDeviceMemory xfer_memory;
+    void* xfer_mapped;
+    uint64_t xfer_size;
 };
 
 struct svk_buffer_t {
@@ -190,8 +202,21 @@ svk_context svk_init(void) {
         .pQueuePriorities = &queue_priority
     };
 
+    /* Enable buffer device addresses when the device offers them (Vulkan 1.2 core). */
+    VkPhysicalDeviceProperties chosen_props;
+    vkGetPhysicalDeviceProperties(ctx->physical_device, &chosen_props);
+    VkPhysicalDeviceVulkan12Features supported12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    VkPhysicalDeviceVulkan12Features enable12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    if (chosen_props.apiVersion >= VK_API_VERSION_1_2) {
+        VkPhysicalDeviceFeatures2 features2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &supported12 };
+        vkGetPhysicalDeviceFeatures2(ctx->physical_device, &features2);
+        enable12.bufferDeviceAddress = supported12.bufferDeviceAddress;
+        ctx->has_device_address = supported12.bufferDeviceAddress == VK_TRUE;
+    }
+
     VkDeviceCreateInfo device_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = (chosen_props.apiVersion >= VK_API_VERSION_1_2) ? &enable12 : NULL,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queue_info
     };
@@ -225,8 +250,13 @@ svk_context svk_init(void) {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 }
     };
 
+    /* Fence for compute batches */
+    VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    vkCreateFence(ctx->device, &fence_info, NULL, &ctx->batch_fence);
+
     VkDescriptorPoolCreateInfo desc_pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, /* sets return on svk_free_pipeline */
         .maxSets = 32,
         .poolSizeCount = 3,
         .pPoolSizes = pool_sizes
@@ -256,7 +286,15 @@ uint32_t svk_get_max_workgroup_size(svk_context ctx) {
 void svk_cleanup(svk_context ctx) {
     if (!ctx) return;
 
+    svk_flush(ctx);
     vkDeviceWaitIdle(ctx->device);
+
+    if (ctx->xfer_buffer) {
+        vkUnmapMemory(ctx->device, ctx->xfer_memory);
+        vkDestroyBuffer(ctx->device, ctx->xfer_buffer, NULL);
+        vkFreeMemory(ctx->device, ctx->xfer_memory, NULL);
+    }
+    if (ctx->batch_fence) vkDestroyFence(ctx->device, ctx->batch_fence, NULL);
 
     if (ctx->staging_buffer) {
         vkDestroyBuffer(ctx->device, ctx->staging_buffer, NULL);
@@ -323,6 +361,7 @@ svk_buffer svk_create_buffer(svk_context ctx, uint64_t size, uint32_t usage) {
 
 int svk_upload_buffer(svk_context ctx, svk_buffer buf, const void* data, uint64_t size, uint64_t offset) {
     if (!ctx || !buf || !data) return 0;
+    if (ctx->batch_open) svk_flush(ctx);
     if (offset + size > buf->size) return 0;
 
     void* mapped;
@@ -335,6 +374,7 @@ int svk_upload_buffer(svk_context ctx, svk_buffer buf, const void* data, uint64_
 
 int svk_download_buffer(svk_context ctx, svk_buffer buf, void* data, uint64_t size, uint64_t offset) {
     if (!ctx || !buf || !data) return 0;
+    if (ctx->batch_open) svk_flush(ctx);
     if (offset + size > buf->size) return 0;
 
     void* mapped;
@@ -351,6 +391,7 @@ uint64_t svk_buffer_size(svk_buffer buf) {
 
 void svk_free_buffer(svk_context ctx, svk_buffer buf) {
     if (!ctx || !buf) return;
+    if (ctx->batch_open) svk_flush(ctx);  /* a recorded dispatch may still use it */
     vkDestroyBuffer(ctx->device, buf->buffer, NULL);
     vkFreeMemory(ctx->device, buf->memory, NULL);
     free(buf);
@@ -541,7 +582,12 @@ svk_pipeline svk_create_pipeline(svk_context ctx, svk_shader shader) {
         .pSetLayouts = &pipe->desc_layout
     };
 
-    vkAllocateDescriptorSets(ctx->device, &alloc_info, &pipe->desc_set);
+    if (vkAllocateDescriptorSets(ctx->device, &alloc_info, &pipe->desc_set) != VK_SUCCESS) {
+        /* Pool exhausted: report failure rather than hand back a pipeline with no set. */
+        vkDestroyDescriptorSetLayout(ctx->device, pipe->desc_layout, NULL);
+        free(pipe);
+        return NULL;
+    }
 
     /* Create pipeline layout with push constants */
     VkPushConstantRange push_range = {
@@ -603,6 +649,7 @@ int svk_set_push_constants(svk_pipeline pipe, const void* data, uint32_t size) {
 
 int svk_dispatch(svk_context ctx, svk_pipeline pipe, uint32_t x, uint32_t y, uint32_t z) {
     if (!ctx || !pipe) return 0;
+    if (ctx->batch_open) svk_flush(ctx);  /* keep queue order with recorded work */
 
     /* Allocate command buffer */
     VkCommandBufferAllocateInfo alloc_info = {
@@ -687,6 +734,8 @@ void svk_wait_idle(svk_context ctx) {
 
 void svk_free_pipeline(svk_context ctx, svk_pipeline pipe) {
     if (!ctx || !pipe) return;
+    if (ctx->batch_open) svk_flush(ctx);
+    if (pipe->desc_set) vkFreeDescriptorSets(ctx->device, ctx->descriptor_pool, 1, &pipe->desc_set);
     vkDestroyPipeline(ctx->device, pipe->pipeline, NULL);
     vkDestroyPipelineLayout(ctx->device, pipe->layout, NULL);
     vkDestroyDescriptorSetLayout(ctx->device, pipe->desc_layout, NULL);
@@ -798,5 +847,286 @@ int svk_download_image(svk_context ctx, svk_image img, void* data) {
     memcpy(data, mapped, image_size);
     vkUnmapMemory(ctx->device, ctx->staging_memory);
 
+    return 1;
+}
+
+/* ============================================================================
+ * Compute batches (0.2.0)
+ *
+ * Device-local buffers carry a 64-bit device address that shaders read
+ * through GL_EXT_buffer_reference, passed in push constants: address
+ * pipelines need no descriptor sets. Dispatches, copies and fills are
+ * recorded into one open command buffer, each followed by a full compute and
+ * transfer memory barrier, and run when the batch is flushed (submit plus a
+ * fence wait). Reads and writes of device-local buffers go through a
+ * host-visible staging buffer and flush first, so they see all recorded work.
+ * ============================================================================ */
+
+#define SVK_BATCH_AUTO_FLUSH 16384u
+#define SVK_XFER_CHUNK (64ull * 1024ull * 1024ull)
+
+static int svk_batch_ensure_open(svk_context ctx) {
+    if (ctx->batch_open) return 1;
+    if (!ctx->batch_cmd) {
+        VkCommandBufferAllocateInfo alloc_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = ctx->command_pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1
+        };
+        if (vkAllocateCommandBuffers(ctx->device, &alloc_info, &ctx->batch_cmd) != VK_SUCCESS) return 0;
+    }
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    if (vkBeginCommandBuffer(ctx->batch_cmd, &begin_info) != VK_SUCCESS) return 0;
+    ctx->batch_open = 1;
+    ctx->batch_count = 0;
+    return 1;
+}
+
+static void svk_batch_barrier(svk_context ctx) {
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                         VK_ACCESS_HOST_READ_BIT
+    };
+    vkCmdPipelineBarrier(ctx->batch_cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &barrier, 0, NULL, 0, NULL);
+}
+
+static void svk_batch_recorded(svk_context ctx) {
+    svk_batch_barrier(ctx);
+    ctx->batch_count++;
+    if (ctx->batch_count >= SVK_BATCH_AUTO_FLUSH) svk_flush(ctx);
+}
+
+int svk_flush(svk_context ctx) {
+    if (!ctx) return 0;
+    if (!ctx->batch_open) return 1;
+    ctx->batch_open = 0;
+    if (vkEndCommandBuffer(ctx->batch_cmd) != VK_SUCCESS) return 0;
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &ctx->batch_cmd
+    };
+    if (vkQueueSubmit(ctx->compute_queue, 1, &submit_info, ctx->batch_fence) != VK_SUCCESS) return 0;
+    VkResult waited = vkWaitForFences(ctx->device, 1, &ctx->batch_fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(ctx->device, 1, &ctx->batch_fence);
+    vkResetCommandBuffer(ctx->batch_cmd, 0);
+    ctx->batch_count = 0;
+    return waited == VK_SUCCESS;
+}
+
+uint32_t svk_pending_commands(svk_context ctx) {
+    return (ctx && ctx->batch_open) ? ctx->batch_count : 0;
+}
+
+int svk_has_device_address(svk_context ctx) {
+    return ctx ? ctx->has_device_address : 0;
+}
+
+svk_buffer svk_create_device_buffer(svk_context ctx, uint64_t size) {
+    if (!ctx || size == 0 || !ctx->has_device_address) return NULL;
+
+    svk_buffer buf = (svk_buffer)calloc(1, sizeof(struct svk_buffer_t));
+    if (!buf) return NULL;
+    buf->size = size;
+    buf->usage = SVK_BUFFER_STORAGE | SVK_BUFFER_TRANSFER;
+
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (vkCreateBuffer(ctx->device, &buffer_info, NULL, &buf->buffer) != VK_SUCCESS) {
+        free(buf);
+        return NULL;
+    }
+
+    VkMemoryRequirements mem_reqs;
+    vkGetBufferMemoryRequirements(ctx->device, buf->buffer, &mem_reqs);
+    uint32_t type = find_memory_type(ctx->physical_device, mem_reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkMemoryAllocateFlagsInfo flags_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &flags_info,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = type
+    };
+    if (type == UINT32_MAX || vkAllocateMemory(ctx->device, &alloc_info, NULL, &buf->memory) != VK_SUCCESS) {
+        vkDestroyBuffer(ctx->device, buf->buffer, NULL);
+        free(buf);
+        return NULL;
+    }
+    vkBindBufferMemory(ctx->device, buf->buffer, buf->memory, 0);
+    return buf;
+}
+
+uint64_t svk_buffer_address(svk_context ctx, svk_buffer buf) {
+    if (!ctx || !buf || !ctx->has_device_address) return 0;
+    VkBufferDeviceAddressInfo info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = buf->buffer
+    };
+    return (uint64_t) vkGetBufferDeviceAddress(ctx->device, &info);
+}
+
+static int svk_xfer_ensure(svk_context ctx, uint64_t size) {
+    if (ctx->xfer_buffer && ctx->xfer_size >= size) return 1;
+    if (ctx->xfer_buffer) {
+        vkUnmapMemory(ctx->device, ctx->xfer_memory);
+        vkDestroyBuffer(ctx->device, ctx->xfer_buffer, NULL);
+        vkFreeMemory(ctx->device, ctx->xfer_memory, NULL);
+        ctx->xfer_buffer = VK_NULL_HANDLE;
+        ctx->xfer_size = 0;
+    }
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (vkCreateBuffer(ctx->device, &buffer_info, NULL, &ctx->xfer_buffer) != VK_SUCCESS) return 0;
+    VkMemoryRequirements mem_reqs;
+    vkGetBufferMemoryRequirements(ctx->device, ctx->xfer_buffer, &mem_reqs);
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = find_memory_type(ctx->physical_device, mem_reqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    };
+    if (vkAllocateMemory(ctx->device, &alloc_info, NULL, &ctx->xfer_memory) != VK_SUCCESS) {
+        vkDestroyBuffer(ctx->device, ctx->xfer_buffer, NULL);
+        ctx->xfer_buffer = VK_NULL_HANDLE;
+        return 0;
+    }
+    vkBindBufferMemory(ctx->device, ctx->xfer_buffer, ctx->xfer_memory, 0);
+    if (vkMapMemory(ctx->device, ctx->xfer_memory, 0, size, 0, &ctx->xfer_mapped) != VK_SUCCESS) return 0;
+    ctx->xfer_size = size;
+    return 1;
+}
+
+int svk_write_buffer(svk_context ctx, svk_buffer buf, const void* data, uint64_t size, uint64_t offset) {
+    if (!ctx || !buf || !data) return 0;
+    if (offset + size > buf->size) return 0;
+    if (!svk_flush(ctx)) return 0;
+    uint64_t done = 0;
+    while (done < size) {
+        uint64_t chunk = size - done;
+        if (chunk > SVK_XFER_CHUNK) chunk = SVK_XFER_CHUNK;
+        if (!svk_xfer_ensure(ctx, chunk)) return 0;
+        memcpy(ctx->xfer_mapped, (const char*) data + done, (size_t) chunk);
+        if (!svk_batch_ensure_open(ctx)) return 0;
+        VkBufferCopy region = { .srcOffset = 0, .dstOffset = offset + done, .size = chunk };
+        vkCmdCopyBuffer(ctx->batch_cmd, ctx->xfer_buffer, buf->buffer, 1, &region);
+        svk_batch_barrier(ctx);
+        if (!svk_flush(ctx)) return 0;
+        done += chunk;
+    }
+    return 1;
+}
+
+int svk_read_buffer(svk_context ctx, svk_buffer buf, void* data, uint64_t size, uint64_t offset) {
+    if (!ctx || !buf || !data) return 0;
+    if (offset + size > buf->size) return 0;
+    uint64_t done = 0;
+    while (done < size) {
+        uint64_t chunk = size - done;
+        if (chunk > SVK_XFER_CHUNK) chunk = SVK_XFER_CHUNK;
+        if (!ctx->xfer_buffer || ctx->xfer_size < chunk) {
+            if (!svk_flush(ctx)) return 0;   /* the old staging buffer may be in use */
+            if (!svk_xfer_ensure(ctx, chunk)) return 0;
+        }
+        if (!svk_batch_ensure_open(ctx)) return 0;
+        VkBufferCopy region = { .srcOffset = offset + done, .dstOffset = 0, .size = chunk };
+        vkCmdCopyBuffer(ctx->batch_cmd, buf->buffer, ctx->xfer_buffer, 1, &region);
+        svk_batch_barrier(ctx);
+        if (!svk_flush(ctx)) return 0;
+        memcpy((char*) data + done, ctx->xfer_mapped, (size_t) chunk);
+        done += chunk;
+    }
+    return 1;
+}
+
+int svk_record_copy(svk_context ctx, svk_buffer src, uint64_t src_offset, svk_buffer dst, uint64_t dst_offset, uint64_t size) {
+    if (!ctx || !src || !dst || size == 0) return 0;
+    if (src_offset + size > src->size || dst_offset + size > dst->size) return 0;
+    if (!svk_batch_ensure_open(ctx)) return 0;
+    VkBufferCopy region = { .srcOffset = src_offset, .dstOffset = dst_offset, .size = size };
+    vkCmdCopyBuffer(ctx->batch_cmd, src->buffer, dst->buffer, 1, &region);
+    svk_batch_recorded(ctx);
+    return 1;
+}
+
+int svk_record_fill(svk_context ctx, svk_buffer buf, uint64_t offset, uint64_t size, uint32_t value) {
+    if (!ctx || !buf || size == 0 || (offset & 3) || (size & 3)) return 0;
+    if (offset + size > buf->size) return 0;
+    if (!svk_batch_ensure_open(ctx)) return 0;
+    vkCmdFillBuffer(ctx->batch_cmd, buf->buffer, offset, size, value);
+    svk_batch_recorded(ctx);
+    return 1;
+}
+
+svk_pipeline svk_create_address_pipeline(svk_context ctx, svk_shader shader) {
+    if (!ctx || !shader) return NULL;
+    svk_pipeline pipe = (svk_pipeline)calloc(1, sizeof(struct svk_pipeline_t));
+    if (!pipe) return NULL;
+
+    VkPushConstantRange push_range = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = SVK_MAX_PUSH_BYTES
+    };
+    VkPipelineLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 0,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_range
+    };
+    if (vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &pipe->layout) != VK_SUCCESS) {
+        free(pipe);
+        return NULL;
+    }
+    VkComputePipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = shader->module,
+            .pName = "main"
+        },
+        .layout = pipe->layout
+    };
+    if (vkCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipe->pipeline) != VK_SUCCESS) {
+        vkDestroyPipelineLayout(ctx->device, pipe->layout, NULL);
+        free(pipe);
+        return NULL;
+    }
+    return pipe;
+}
+
+int svk_record_dispatch(svk_context ctx, svk_pipeline pipe, const void* push, uint32_t push_size,
+                        uint32_t x, uint32_t y, uint32_t z) {
+    if (!ctx || !pipe || push_size > SVK_MAX_PUSH_BYTES || (push_size > 0 && !push)) return 0;
+    if (pipe->desc_set) return 0;   /* descriptor pipelines use svk_dispatch */
+    if (!svk_batch_ensure_open(ctx)) return 0;
+    vkCmdBindPipeline(ctx->batch_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipeline);
+    if (push_size > 0) {
+        vkCmdPushConstants(ctx->batch_cmd, pipe->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
+    }
+    vkCmdDispatch(ctx->batch_cmd, x, y, z);
+    svk_batch_recorded(ctx);
     return 1;
 }

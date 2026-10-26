@@ -3,7 +3,7 @@
 	<description>Vulkan GPU compute library for the simple_* ecosystem. Cross-platform GPU acceleration for NVIDIA, AMD, and Intel GPUs.</description>
 	<target name="simple_vulkan">
 		<root all_classes="true"/>
-		<version major="0" minor="1" release="0" build="1"/>
+		<version major="0" minor="2" release="0" build="1"/>
 		<option warning="warning" manifest_array_type="mismatch_warning">
 			<assertions precondition="true" postcondition="true" check="true" invariant="true" loop="true" supplier_precondition="true"/>
 		</option>
@@ -33,6 +33,7 @@
 		<root class="TEST_APP" feature="make"/>
 		<library name="simple_testing" location="$SIMPLE_EIFFEL\simple_testing\simple_testing.ecf"/>
 		<library name="testing" location="$ISE_LIBRARY\library\testing\testing.ecf"/>
+		<library name="simple_shaderc" location="$SIMPLE_EIFFEL\simple_shaderc\simple_shaderc.ecf"/>
 		<cluster name="test_classes" location=".\testing\" recursive="true"/>
 	</target>
 </system>

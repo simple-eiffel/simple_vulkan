@@ -16,7 +16,7 @@ Part of the [Simple Eiffel](https://github.com/simple-eiffel) ecosystem.
 
 ## Status
 
-**Production** - 7 tests passing, supports NVIDIA, AMD, and Intel GPUs
+**Production** - 12 tests passing (5 for compute batches, added in 0.2.0), supports NVIDIA, AMD, and Intel GPUs
 
 ## Overview
 
@@ -52,6 +52,7 @@ end
 - **Image Output** - Create GPU images for rendering results
 - **Push Constants** - Fast-changing uniforms for real-time applications
 - **Vendor Detection** - Query GPU vendor for vendor-specific optimizations
+- **Compute Batches (0.2.0)** - Device-local buffers addressed straight from shaders (no descriptor sets), dispatches recorded into one command buffer and run at a single `flush`
 
 ## Installation
 
@@ -117,6 +118,33 @@ do
 end
 ```
 
+## Compute Batches (0.2.0)
+
+For many small kernels in a row (training a neural network, for example), use device-local buffers and address pipelines. The shader reads its buffers through 64-bit device addresses passed in push constants, so one pipeline can be recorded any number of times with different buffers, and nothing runs until `flush` (or a `read`/`write`, which flush first).
+
+```eiffel
+create a.make (ctx, 4 * n)                      -- VULKAN_DEVICE_BUFFER
+create c.make (ctx, 4 * n)
+ok := a.write (host.item, 4 * n, 0)
+create pipe.make (ctx, shader)                  -- VULKAN_ADDRESS_PIPELINE
+push.put_natural_64 (a.address, 0)
+push.put_natural_64 (c.address, 8)
+push.put_natural_32 (n.to_natural_32, 16)
+ok := pipe.record (push.item, 20, (n + 255) // 256, 1, 1)
+ok := c.read (host.item, 4 * n, 0)              -- runs the batch, then copies back
+```
+
+```glsl
+#version 460
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430) buffer Floats { float v[]; };
+layout(push_constant) uniform P { Floats a; Floats c; uint n; } p;
+void main() { uint i = gl_GlobalInvocationID.x; if (i < p.n) p.c.v[i] = 2.0 * p.a.v[i]; }
+```
+
+Each recorded command is followed by a full memory barrier, so later dispatches see earlier results. Flushes, transfers and frees are `blocking` externals: a SCOOP processor waiting on the GPU never stalls another processor's garbage collector.
+
 ## Writing Compute Shaders
 
 Compute shaders must be GLSL compiled to SPIR-V:
@@ -142,7 +170,7 @@ Compile with:
 ## Dependencies
 
 - Vulkan SDK (https://vulkan.lunarg.com/)
-- No Eiffel library dependencies
+- No Eiffel library dependencies (the test target also uses simple_shaderc to compile its shaders)
 
 ## Performance
 
@@ -150,6 +178,9 @@ Tested on NVIDIA GeForce RTX 5070 Ti:
 - Context creation: <10ms
 - Buffer operations: Near-instant
 - 4K SDF ray marching: 63 FPS
+- Compute batches (0.2.0, spike S-5 in simple_tensor):
+  - 1,000 small dispatches: 6 ms recorded in one batch, against 74 ms with a submit and wait each.
+  - Tiled matmul on device-local buffers: 3,616 GFLOP/s at 2048³, against 332 on host-visible buffers.
 
 ## License
 

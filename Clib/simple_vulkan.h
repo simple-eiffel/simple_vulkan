@@ -141,6 +141,28 @@ int svk_dispatch(svk_context ctx, svk_pipeline pipe, uint32_t x, uint32_t y, uin
 /* Wait for GPU to finish */
 void svk_wait_idle(svk_context ctx);
 
+/* ============================================================================
+ * Compute batches (0.2.0)
+ * Device-local buffers addressed from shaders (GL_EXT_buffer_reference, the
+ * addresses passed in push constants); dispatches, copies and fills recorded
+ * into one command buffer and run at svk_flush. Reads and writes flush first.
+ * ============================================================================ */
+
+#define SVK_MAX_PUSH_BYTES 128
+
+int svk_has_device_address(svk_context ctx);
+svk_buffer svk_create_device_buffer(svk_context ctx, uint64_t size);
+uint64_t svk_buffer_address(svk_context ctx, svk_buffer buf);
+int svk_write_buffer(svk_context ctx, svk_buffer buf, const void* data, uint64_t size, uint64_t offset);
+int svk_read_buffer(svk_context ctx, svk_buffer buf, void* data, uint64_t size, uint64_t offset);
+svk_pipeline svk_create_address_pipeline(svk_context ctx, svk_shader shader);
+int svk_record_dispatch(svk_context ctx, svk_pipeline pipe, const void* push, uint32_t push_size,
+                        uint32_t x, uint32_t y, uint32_t z);
+int svk_record_copy(svk_context ctx, svk_buffer src, uint64_t src_offset, svk_buffer dst, uint64_t dst_offset, uint64_t size);
+int svk_record_fill(svk_context ctx, svk_buffer buf, uint64_t offset, uint64_t size, uint32_t value);
+int svk_flush(svk_context ctx);
+uint32_t svk_pending_commands(svk_context ctx);
+
 /* Free pipeline */
 void svk_free_pipeline(svk_context ctx, svk_pipeline pipe);
 

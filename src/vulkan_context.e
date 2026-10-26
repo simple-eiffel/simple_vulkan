@@ -128,6 +128,39 @@ feature -- Status
 			Result := vendor_id = Vendor_intel
 		end
 
+feature -- Compute batches (0.2.0)
+
+	has_device_address: BOOLEAN
+			-- Can shaders address device-local buffers (VULKAN_DEVICE_BUFFER,
+			-- VULKAN_ADDRESS_PIPELINE)? Vulkan 1.2 bufferDeviceAddress.
+		require
+			valid: is_valid
+		do
+			Result := svk_has_device_address (handle) /= 0
+		end
+
+	pending_commands: INTEGER
+			-- Dispatches, copies and fills recorded since the last `flush'.
+		require
+			valid: is_valid
+		do
+			Result := svk_pending_commands (handle).to_integer_32
+		end
+
+	flush
+			-- Run everything recorded and wait for the GPU to finish it.
+			-- (A blocking external: another SCOOP processor's collector never waits on it.)
+		require
+			valid: is_valid
+		do
+			last_flush_succeeded := svk_flush (handle) /= 0
+		ensure
+			nothing_pending: last_flush_succeeded implies pending_commands = 0
+		end
+
+	last_flush_succeeded: BOOLEAN
+			-- Did the last `flush' submit and complete?
+
 feature -- Disposal
 
 	dispose
@@ -182,9 +215,30 @@ feature {NONE} -- C Externals
 
 	svk_cleanup (ctx: POINTER)
 		external
-			"C inline use <simple_vulkan.h>"
+			"C blocking inline use <simple_vulkan.h>"
 		alias
 			"svk_cleanup((svk_context)$ctx);"
+		end
+
+	svk_has_device_address (ctx: POINTER): INTEGER
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return svk_has_device_address((svk_context)$ctx);"
+		end
+
+	svk_pending_commands (ctx: POINTER): NATURAL_32
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return svk_pending_commands((svk_context)$ctx);"
+		end
+
+	svk_flush (ctx: POINTER): INTEGER
+		external
+			"C blocking inline use <simple_vulkan.h>"
+		alias
+			"return svk_flush((svk_context)$ctx);"
 		end
 
 invariant

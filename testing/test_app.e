@@ -30,9 +30,13 @@ feature -- Tests
 			-- Execute all tests.
 		local
 			tests: LIB_TESTS
+			batch: BATCH_TESTS
 		do
 			create tests.make
 			tests.run_all
+			create batch.make
+			batch.run_all
+			print ("Batch results: " + batch.passed.out + " passed, " + batch.failed.out + " failed%N")
 		end
 
 end
