@@ -146,7 +146,29 @@ feature -- Disposal
 			released: not is_valid and handle = default_pointer
 		end
 
+	recycle
+			-- Give the buffer to the context's pool for reuse by a later `make' of the same
+			-- size (0.3.0); beyond the pool limit it is freed (deferred). Safe at once and from
+			-- a collector's `dispose'. The contents are not kept.
+		do
+			if is_valid then
+				svk_recycle_buffer (context.handle, handle)
+				handle := default_pointer
+				is_valid := False
+				address := 0
+			end
+		ensure
+			recycled: not is_valid and handle = default_pointer
+		end
+
 feature {NONE} -- C externals
+
+	svk_recycle_buffer (ctx, buf: POINTER)
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"svk_recycle_buffer((svk_context)$ctx, (svk_buffer)$buf);"
+		end
 
 	svk_free_buffer_deferred (ctx, buf: POINTER)
 		external

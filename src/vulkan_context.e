@@ -169,6 +169,45 @@ feature -- Compute batches (0.2.0)
 			Result := svk_queued_frees (handle).to_integer_32
 		end
 
+feature -- Device-buffer pool (0.3.0)
+
+	pooled_bytes: INTEGER_64
+			-- Bytes held by recycled device buffers awaiting reuse.
+		require
+			valid: is_valid
+		do
+			Result := svk_pool_bytes (handle).to_integer_64
+		end
+
+	pool_hits: INTEGER_64
+			-- Device-buffer creations served from the pool so far.
+		require
+			valid: is_valid
+		do
+			Result := svk_pool_hits (handle).to_integer_64
+		end
+
+	set_pool_limit (a_bytes: INTEGER_64)
+			-- Keep at most `a_bytes' in the pool (default 1 GiB); frees the excess.
+		require
+			valid: is_valid
+			non_negative: a_bytes >= 0
+		do
+			svk_set_pool_limit (handle, a_bytes.to_natural_64)
+		ensure
+			within: pooled_bytes <= a_bytes
+		end
+
+	trim_pool
+			-- Free every pooled buffer (deferred while a batch is open).
+		require
+			valid: is_valid
+		do
+			svk_trim_pool (handle)
+		ensure
+			empty: pooled_bytes = 0
+		end
+
 feature -- Disposal
 
 	dispose
@@ -240,6 +279,34 @@ feature {NONE} -- C Externals
 			"C inline use <simple_vulkan.h>"
 		alias
 			"return svk_pending_commands((svk_context)$ctx);"
+		end
+
+	svk_pool_bytes (ctx: POINTER): NATURAL_64
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return (EIF_NATURAL_64) svk_pool_bytes((svk_context)$ctx);"
+		end
+
+	svk_pool_hits (ctx: POINTER): NATURAL_64
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"return (EIF_NATURAL_64) svk_pool_hits((svk_context)$ctx);"
+		end
+
+	svk_set_pool_limit (ctx: POINTER; a_bytes: NATURAL_64)
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"svk_set_pool_limit((svk_context)$ctx, (uint64_t)$a_bytes);"
+		end
+
+	svk_trim_pool (ctx: POINTER)
+		external
+			"C inline use <simple_vulkan.h>"
+		alias
+			"svk_trim_pool((svk_context)$ctx);"
 		end
 
 	svk_queued_frees (ctx: POINTER): NATURAL_32

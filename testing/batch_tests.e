@@ -35,6 +35,7 @@ feature -- Execution
 				check_that ("recorded copy between device buffers", recorded_copy)
 				check_that ("100 descriptor pipelines created and freed (pool holds 32)", descriptor_sets_returned)
 				check_that ("deferred release: queued while a batch is open, freed at flush", deferred_release)
+				check_that ("pool: recycled buffer reused by size, reuse ordered after old use, limit and trim", pool_reuse)
 			else
 				print ("Test: compute batches... SKIP (no device addresses)%N")
 			end
@@ -217,6 +218,51 @@ feature {NONE} -- Tests
 					and l_host.read_real_32 (0) = 1.0 and l_host.read_real_32 (1020) = 1.0
 				x.release_deferred
 				Result := Result and ctx.queued_frees = 0
+				p.dispose
+			end
+			keep.dispose
+		end
+
+	pool_reuse: BOOLEAN
+			-- A buffer recycled while a recorded dispatch still writes it is handed to the next
+			-- same-size `make'; that new owner's fill is ordered after the old dispatch, so a
+			-- read shows the fill, not the old increments. Other sizes allocate fresh.
+		local
+			x, y, z, keep: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_push, l_host: MANAGED_POINTER
+			l_hits: INTEGER_64
+		do
+			ctx.trim_pool
+			ctx.flush
+			create x.make (ctx, 4096)
+			create keep.make (ctx, 4096)
+			create l_host.make (4096)
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (x.address, 0)
+				l_push.put_natural_32 (1024, 8)
+				l_hits := ctx.pool_hits
+				Result := x.record_fill (0, 4096, 0) and p.record (l_push.item, 12, 4, 1, 1)
+					and x.record_copy_to (keep, 0, 0, 4096)
+				x.recycle
+				Result := Result and ctx.pooled_bytes = 4096
+				create y.make (ctx, 4096)
+				Result := Result and ctx.pool_hits = l_hits + 1 and ctx.pooled_bytes = 0
+				Result := Result and y.record_fill (0, 4096, 0x40A00000) and y.read (l_host.item, 4096, 0)
+					and l_host.read_real_32 (0) = 5.0 and l_host.read_real_32 (4092) = 5.0
+				Result := Result and keep.read (l_host.item, 4096, 0) and l_host.read_real_32 (0) = 1.0
+				create z.make (ctx, 8192)
+				Result := Result and ctx.pool_hits = l_hits + 1
+				y.recycle
+				z.recycle
+				Result := Result and ctx.pooled_bytes = 4096 + 8192
+				ctx.set_pool_limit (5000)
+				Result := Result and ctx.pooled_bytes <= 5000
+				ctx.trim_pool
+				Result := Result and ctx.pooled_bytes = 0
+				ctx.set_pool_limit (1024 * 1024 * 1024)
 				p.dispose
 			end
 			keep.dispose

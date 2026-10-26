@@ -163,6 +163,15 @@ int svk_record_fill(svk_context ctx, svk_buffer buf, uint64_t offset, uint64_t s
 int svk_flush(svk_context ctx);
 uint32_t svk_pending_commands(svk_context ctx);
 void svk_free_buffer_deferred(svk_context ctx, svk_buffer buf);  /* safe while a batch is open (from a collector) */
+
+/* Device-buffer pool (0.3.0): recycle instead of free; create_device_buffer reuses an
+   exact-size buffer. Safe at once and from a collector (no Eiffel allocation). */
+#define SVK_BUFFER_DEVICE_LOCAL 0x100
+void svk_recycle_buffer(svk_context ctx, svk_buffer buf);
+void svk_trim_pool(svk_context ctx);
+void svk_set_pool_limit(svk_context ctx, uint64_t bytes);
+uint64_t svk_pool_bytes(svk_context ctx);
+uint64_t svk_pool_hits(svk_context ctx);
 uint32_t svk_queued_frees(svk_context ctx);
 
 /* Free pipeline */

@@ -1,5 +1,10 @@
 # Changelog: simple_vulkan
 
+## 0.3.0 (2026-10-26): device-buffer pool
+- `VULKAN_DEVICE_BUFFER.recycle` hands a buffer to the context's pool, and the next `make` of the same byte size reuses it, skipping the driver allocation. Reuse is safe at once: commands run in recorded order with a barrier after each, so the new first use follows the old last use. `recycle` is safe from a garbage collector's `dispose`.
+- `VULKAN_CONTEXT`: `pooled_bytes`, `pool_hits`, `set_pool_limit` (default 1 GiB; bytes beyond it are freed, deferred) and `trim_pool`.
+- Test: a buffer recycled while a dispatch still writes it is reused, and the new owner's fill lands after the old dispatch; other sizes allocate fresh; the limit and trim are checked. 14/14.
+
 ## 0.2.0 (2026-10-26): compute batches
 Gap G-4 for simple_tensor's GPU backend.
 

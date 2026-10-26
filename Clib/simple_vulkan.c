@@ -50,6 +50,12 @@ struct svk_context_t {
     struct svk_buffer_t** free_queue;   /* buffers freed while a batch was open */
     uint32_t free_count;
     uint32_t free_capacity;
+    struct svk_buffer_t** pool;         /* recycled device buffers, matched by exact size */
+    uint32_t pool_count;
+    uint32_t pool_capacity;
+    uint64_t pool_bytes;
+    uint64_t pool_limit;
+    uint64_t pool_hits;
 };
 
 struct svk_buffer_t {
@@ -299,6 +305,12 @@ void svk_cleanup(svk_context ctx) {
     }
     if (ctx->batch_fence) vkDestroyFence(ctx->device, ctx->batch_fence, NULL);
     free(ctx->free_queue);
+    for (uint32_t i = 0; i < ctx->pool_count; i++) {
+        vkDestroyBuffer(ctx->device, ctx->pool[i]->buffer, NULL);
+        vkFreeMemory(ctx->device, ctx->pool[i]->memory, NULL);
+        free(ctx->pool[i]);
+    }
+    free(ctx->pool);
 
     if (ctx->staging_buffer) {
         vkDestroyBuffer(ctx->device, ctx->staging_buffer, NULL);
@@ -974,13 +986,79 @@ int svk_has_device_address(svk_context ctx) {
     return ctx ? ctx->has_device_address : 0;
 }
 
+/* ----------------------------------------------------------------------------
+ * Device-buffer pool (0.3.0). A recycled buffer is reusable at once: commands
+ * run in recorded order with a full barrier after each, so its new first use
+ * always follows its old last use. Matched by exact size (training repeats
+ * shapes); bytes above pool_limit go back to the driver (deferred free).
+ * ---------------------------------------------------------------------------- */
+
+#define SVK_DEFAULT_POOL_LIMIT (1024ull * 1024ull * 1024ull)
+
+static svk_buffer svk_pool_take(svk_context ctx, uint64_t size) {
+    for (uint32_t i = ctx->pool_count; i > 0; i--) {
+        svk_buffer b = ctx->pool[i - 1];
+        if (b->size == size) {
+            ctx->pool[i - 1] = ctx->pool[ctx->pool_count - 1];
+            ctx->pool_count--;
+            ctx->pool_bytes -= size;
+            ctx->pool_hits++;
+            return b;
+        }
+    }
+    return NULL;
+}
+
+void svk_recycle_buffer(svk_context ctx, svk_buffer buf) {
+    if (!ctx || !buf) return;
+    uint64_t limit = ctx->pool_limit ? ctx->pool_limit : SVK_DEFAULT_POOL_LIMIT;
+    if (!(buf->usage & SVK_BUFFER_DEVICE_LOCAL) || ctx->pool_bytes + buf->size > limit) {
+        svk_free_buffer_deferred(ctx, buf);
+        return;
+    }
+    if (ctx->pool_count == ctx->pool_capacity) {
+        uint32_t cap = ctx->pool_capacity ? 2 * ctx->pool_capacity : 256;
+        struct svk_buffer_t** grown = (struct svk_buffer_t**) realloc(ctx->pool, cap * sizeof(*grown));
+        if (!grown) { svk_free_buffer_deferred(ctx, buf); return; }
+        ctx->pool = grown;
+        ctx->pool_capacity = cap;
+    }
+    ctx->pool[ctx->pool_count++] = buf;
+    ctx->pool_bytes += buf->size;
+}
+
+void svk_trim_pool(svk_context ctx) {
+    if (!ctx) return;
+    while (ctx->pool_count > 0) {
+        svk_buffer b = ctx->pool[--ctx->pool_count];
+        ctx->pool_bytes -= b->size;
+        svk_free_buffer_deferred(ctx, b);
+    }
+}
+
+void svk_set_pool_limit(svk_context ctx, uint64_t bytes) {
+    if (!ctx) return;
+    ctx->pool_limit = bytes;
+    while (ctx->pool_count > 0 && ctx->pool_bytes > bytes) {
+        svk_buffer b = ctx->pool[--ctx->pool_count];
+        ctx->pool_bytes -= b->size;
+        svk_free_buffer_deferred(ctx, b);
+    }
+}
+
+uint64_t svk_pool_bytes(svk_context ctx) { return ctx ? ctx->pool_bytes : 0; }
+uint64_t svk_pool_hits(svk_context ctx) { return ctx ? ctx->pool_hits : 0; }
+
 svk_buffer svk_create_device_buffer(svk_context ctx, uint64_t size) {
     if (!ctx || size == 0 || !ctx->has_device_address) return NULL;
+
+    svk_buffer pooled = svk_pool_take(ctx, size);
+    if (pooled) return pooled;
 
     svk_buffer buf = (svk_buffer)calloc(1, sizeof(struct svk_buffer_t));
     if (!buf) return NULL;
     buf->size = size;
-    buf->usage = SVK_BUFFER_STORAGE | SVK_BUFFER_TRANSFER;
+    buf->usage = SVK_BUFFER_STORAGE | SVK_BUFFER_TRANSFER | SVK_BUFFER_DEVICE_LOCAL;
 
     VkBufferCreateInfo buffer_info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
