@@ -205,6 +205,13 @@ static int svk_instance_has_extension(const char* name) {
 /* Does `device' run 16x16x16 subgroup cooperative matrices with bf16 A and B and f32 C and
    result (the shape the tensor kernels use)? An extension function: found through the instance. */
 static int svk_has_bf16_16x16x16(VkInstance instance, VkPhysicalDevice device) {
+#ifndef VK_KHR_shader_bfloat16
+    /* Vulkan headers older than VK_KHR_shader_bfloat16 (Ubuntu 24.04 has 1.3.275):
+       no bf16 cooperative matrices, so the tensor-core path reports itself absent. */
+    (void) instance;
+    (void) device;
+    return 0;
+#else
     PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_props = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
         vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
     uint32_t count = 0;
@@ -223,6 +230,7 @@ static int svk_has_bf16_16x16x16(VkInstance instance, VkPhysicalDevice device) {
     }
     free(props);
     return found;
+#endif
 }
 
 /* ============================================================================
@@ -324,25 +332,29 @@ svk_context svk_init(void) {
     vkGetPhysicalDeviceProperties(ctx->physical_device, &chosen_props);
     VkPhysicalDeviceVulkan12Features supported12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
     VkPhysicalDeviceVulkan12Features enable12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    const char* extensions[3];
+    uint32_t extension_count = 0;
+    int coop = 0;
+#ifdef VK_KHR_shader_bfloat16
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR supported_coop = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR enable_coop = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
     VkPhysicalDeviceShaderBfloat16FeaturesKHR supported_bf16 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR };
     VkPhysicalDeviceShaderBfloat16FeaturesKHR enable_bf16 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR };
-    const char* extensions[3];
-    uint32_t extension_count = 0;
-    int coop = chosen_props.apiVersion >= VK_API_VERSION_1_3
+    coop = chosen_props.apiVersion >= VK_API_VERSION_1_3
         && svk_device_has_extension(ctx->physical_device, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)
         && svk_device_has_extension(ctx->physical_device, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
     if (coop) {
         supported12.pNext = &supported_coop;
         supported_coop.pNext = &supported_bf16;
     }
+#endif
     if (chosen_props.apiVersion >= VK_API_VERSION_1_2) {
         VkPhysicalDeviceFeatures2 features2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &supported12 };
         vkGetPhysicalDeviceFeatures2(ctx->physical_device, &features2);
         enable12.bufferDeviceAddress = supported12.bufferDeviceAddress;
         ctx->has_device_address = supported12.bufferDeviceAddress == VK_TRUE;
     }
+#ifdef VK_KHR_shader_bfloat16
     coop = coop && supported_coop.cooperativeMatrix && supported_bf16.shaderBFloat16Type
         && supported_bf16.shaderBFloat16CooperativeMatrix && supported12.vulkanMemoryModel
         && svk_has_bf16_16x16x16(ctx->instance, ctx->physical_device);
@@ -358,6 +370,7 @@ svk_context svk_init(void) {
         extensions[extension_count++] = VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME;
         ctx->has_coop_bf16 = 1;
     }
+#endif
     /* A portability device (MoltenVK) must have its subset extension enabled. */
     if (svk_device_has_extension(ctx->physical_device, "VK_KHR_portability_subset")) {
         extensions[extension_count++] = "VK_KHR_portability_subset";
