@@ -5,7 +5,9 @@
  * Handles device selection, memory management, shader loading, and dispatch.
  */
 
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,6 +188,20 @@ static int svk_device_has_extension(VkPhysicalDevice device, const char* name) {
     return found;
 }
 
+/* Does the Vulkan loader offer the instance extension `name'? */
+static int svk_instance_has_extension(const char* name) {
+    uint32_t count = 0;
+    int found = 0;
+    if (vkEnumerateInstanceExtensionProperties(NULL, &count, NULL) != VK_SUCCESS || count == 0) return 0;
+    VkExtensionProperties* props = (VkExtensionProperties*) malloc(count * sizeof(VkExtensionProperties));
+    if (!props) return 0;
+    if (vkEnumerateInstanceExtensionProperties(NULL, &count, props) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < count && !found; i++) found = strcmp(props[i].extensionName, name) == 0;
+    }
+    free(props);
+    return found;
+}
+
 /* Does `device' run 16x16x16 subgroup cooperative matrices with bf16 A and B and f32 C and
    result (the shape the tensor kernels use)? An extension function: found through the instance. */
 static int svk_has_bf16_16x16x16(VkInstance instance, VkPhysicalDevice device) {
@@ -231,6 +247,16 @@ svk_context svk_init(void) {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &app_info
     };
+
+    /* A device that implements Vulkan on top of another API, such as MoltenVK on
+       Metal, is listed only when the instance asks for portability devices. */
+    const char* instance_extensions[1];
+    if (svk_instance_has_extension(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        instance_extensions[0] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+        create_info.enabledExtensionCount = 1;
+        create_info.ppEnabledExtensionNames = instance_extensions;
+        create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
 
     if (vkCreateInstance(&create_info, NULL, &ctx->instance) != VK_SUCCESS) {
         free(ctx);
@@ -302,7 +328,7 @@ svk_context svk_init(void) {
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR enable_coop = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
     VkPhysicalDeviceShaderBfloat16FeaturesKHR supported_bf16 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR };
     VkPhysicalDeviceShaderBfloat16FeaturesKHR enable_bf16 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR };
-    const char* extensions[2];
+    const char* extensions[3];
     uint32_t extension_count = 0;
     int coop = chosen_props.apiVersion >= VK_API_VERSION_1_3
         && svk_device_has_extension(ctx->physical_device, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)
@@ -331,6 +357,10 @@ svk_context svk_init(void) {
         extensions[extension_count++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
         extensions[extension_count++] = VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME;
         ctx->has_coop_bf16 = 1;
+    }
+    /* A portability device (MoltenVK) must have its subset extension enabled. */
+    if (svk_device_has_extension(ctx->physical_device, "VK_KHR_portability_subset")) {
+        extensions[extension_count++] = "VK_KHR_portability_subset";
     }
 
     VkDeviceCreateInfo device_info = {
