@@ -141,6 +141,54 @@ int svk_dispatch(svk_context ctx, svk_pipeline pipe, uint32_t x, uint32_t y, uin
 /* Wait for GPU to finish */
 void svk_wait_idle(svk_context ctx);
 
+/* ============================================================================
+ * Compute batches (0.2.0)
+ * Device-local buffers addressed from shaders (GL_EXT_buffer_reference, the
+ * addresses passed in push constants); dispatches, copies and fills recorded
+ * into one command buffer and run at svk_flush. Reads and writes flush first.
+ * ============================================================================ */
+
+#define SVK_MAX_PUSH_BYTES 128
+
+int svk_has_device_address(svk_context ctx);
+int svk_has_cooperative_matrix_bf16(svk_context ctx);   /* 0.6.0 */
+svk_buffer svk_create_device_buffer(svk_context ctx, uint64_t size);
+uint64_t svk_buffer_address(svk_context ctx, svk_buffer buf);
+int svk_write_buffer(svk_context ctx, svk_buffer buf, const void* data, uint64_t size, uint64_t offset);
+int svk_read_buffer(svk_context ctx, svk_buffer buf, void* data, uint64_t size, uint64_t offset);
+svk_pipeline svk_create_address_pipeline(svk_context ctx, svk_shader shader);
+int svk_record_dispatch(svk_context ctx, svk_pipeline pipe, const void* push, uint32_t push_size,
+                        uint32_t x, uint32_t y, uint32_t z);
+int svk_record_copy(svk_context ctx, svk_buffer src, uint64_t src_offset, svk_buffer dst, uint64_t dst_offset, uint64_t size);
+int svk_record_fill(svk_context ctx, svk_buffer buf, uint64_t offset, uint64_t size, uint32_t value);
+int svk_flush(svk_context ctx);
+uint32_t svk_pending_commands(svk_context ctx);
+uint32_t svk_slots_in_flight(svk_context ctx);   /* 0.7.0 */
+uint64_t svk_flush_count(svk_context ctx);       /* 0.7.0 */
+uint64_t svk_wait_ns(svk_context ctx);           /* 0.7.0 */
+void svk_free_buffer_deferred(svk_context ctx, svk_buffer buf);  /* safe while a batch is open (from a collector) */
+
+/* Device-buffer pool (0.3.0): recycle instead of free; create_device_buffer reuses an
+   exact-size buffer. Safe at once and from a collector (no Eiffel allocation). */
+#define SVK_BUFFER_DEVICE_LOCAL 0x100
+void svk_recycle_buffer(svk_context ctx, svk_buffer buf);
+void svk_trim_pool(svk_context ctx);
+void svk_set_pool_limit(svk_context ctx, uint64_t bytes);
+uint64_t svk_pool_bytes(svk_context ctx);
+uint64_t svk_pool_hits(svk_context ctx);
+
+/* Profiling (0.4.0): with profiling on, each recorded dispatch is bracketed by GPU
+   timestamps; at every flush the elapsed time is added to its pipeline. */
+int svk_set_profiling(svk_context ctx, int on);
+uint64_t svk_pipeline_profiled_ns(svk_pipeline pipe);
+uint64_t svk_pipeline_profiled_calls(svk_pipeline pipe);
+void svk_pipeline_reset_profile(svk_pipeline pipe);
+
+/* Recorded uploads (0.5.0): copy `size' bytes into a per-batch host arena now and record the
+   copy to `buf'; nothing is flushed. Falls back to svk_write_buffer when the arena is full. */
+int svk_record_write(svk_context ctx, svk_buffer buf, const void* data, uint64_t size, uint64_t offset);
+uint32_t svk_queued_frees(svk_context ctx);
+
 /* Free pipeline */
 void svk_free_pipeline(svk_context ctx, svk_pipeline pipe);
 

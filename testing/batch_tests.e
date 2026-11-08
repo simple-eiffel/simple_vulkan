@@ -1,0 +1,581 @@
+note
+	description: "[
+		Tests for compute batches (0.2.0): device-local buffers, address pipelines,
+		recorded dispatches, copies and fills, flush; and the descriptor-set leak fix.
+		Shaders are compiled at run time by simple_shaderc (test target only).
+	]"
+	author: "Larry Rix"
+
+class
+	BATCH_TESTS
+
+create
+	make
+
+feature {NONE} -- Initialization
+
+	make
+		do
+			create ctx.make
+		end
+
+feature -- Access
+
+	ctx: VULKAN_CONTEXT
+	passed, failed: INTEGER
+
+feature -- Execution
+
+	run_all
+		do
+			if ctx.is_valid and then ctx.has_device_address then
+				check_that ("device buffer round trip (16 MB), offset read, fills", device_buffer_round_trip)
+				check_that ("address pipeline: vector add of 1,000,003 floats", vector_add)
+				check_that ("1,000 dependent dispatches in one batch run in order", batched_increments)
+				check_that ("recorded copy between device buffers", recorded_copy)
+				check_that ("100 descriptor pipelines created and freed (pool holds 32)", descriptor_sets_returned)
+				check_that ("deferred release: queued while a batch is open, freed at flush", deferred_release)
+				check_that ("pool: recycled buffer reused by size, reuse ordered after old use, limit and trim", pool_reuse)
+				check_that ("pool size classes: 1,000 B recycled serves 1,020 B (class 1,024), not 1,100 B (class 1,280)", pool_size_classes)
+				check_that ("profiling: 200 dispatches timed on the GPU, none when off", profiling)
+				check_that ("recorded uploads: three payloads in one batch, no flush, all intact", recorded_uploads)
+				check_that ("async submission: 400 increments go out in slots while recording, in order; frees wait for them", async_submission)
+				if ctx.has_cooperative_matrix_bf16 then
+					check_that ("cooperative matrix: 16x16 bf16 product on tensor cores = host's", cooperative_matrix_bf16)
+				else
+					print ("Test: cooperative matrix... SKIP (no bf16 cooperative matrices on this device)%N")
+				end
+			else
+				print ("Test: compute batches... SKIP (no device addresses)%N")
+			end
+			ctx.dispose
+		end
+
+feature {NONE} -- Tests
+
+	device_buffer_round_trip: BOOLEAN
+		local
+			b: VULKAN_DEVICE_BUFFER
+			l_out, l_in: MANAGED_POINTER
+			i, n: INTEGER
+		do
+			n := 4 * 1024 * 1024
+			create b.make (ctx, n * 4)
+			create l_out.make (n * 4)
+			create l_in.make (n * 4)
+			from i := 0 until i = n loop
+				l_out.put_integer_32 (i * 7 - 3, i * 4)
+				i := i + 1
+			end
+			Result := b.is_valid and b.address /= 0 and b.write (l_out.item, n * 4, 0) and b.read (l_in.item, n * 4, 0)
+			Result := Result and l_in.item.memory_compare (l_out.item, n * 4)
+				-- Offset read of 8 bytes from element 1000.
+			Result := Result and b.read (l_in.item, 8, 4000) and l_in.read_integer_32 (0) = 6997 and l_in.read_integer_32 (4) = 7004
+				-- Recorded fills: ones in the first 16 bytes, zeros after.
+			Result := Result and b.record_fill (0, 16, 0x3F800000) and b.record_fill (16, 16, 0)
+			Result := Result and b.read (l_in.item, 32, 0)
+			Result := Result and l_in.read_real_32 (0) = 1.0 and l_in.read_real_32 (12) = 1.0 and l_in.read_integer_32 (16) = 0 and l_in.read_integer_32 (28) = 0
+			b.dispose
+		end
+
+	vector_add: BOOLEAN
+		local
+			a, b, c: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_a, l_b, l_c, l_push: MANAGED_POINTER
+			i, n: INTEGER
+		do
+			n := 1_000_003
+			create l_a.make (n * 4); create l_b.make (n * 4); create l_c.make (n * 4)
+			from i := 0 until i = n loop
+				l_a.put_real_32 (i.to_real, i * 4)
+				l_b.put_real_32 ((2 * i).to_real, i * 4)
+				i := i + 1
+			end
+			create a.make (ctx, n * 4); create b.make (ctx, n * 4); create c.make (ctx, n * 4)
+			if attached pipeline (Add_glsl) as l_p then
+				p := l_p
+				create l_push.make (28)
+				l_push.put_natural_64 (a.address, 0)
+				l_push.put_natural_64 (b.address, 8)
+				l_push.put_natural_64 (c.address, 16)
+				l_push.put_natural_32 (n.to_natural_32, 24)
+				Result := a.write (l_a.item, n * 4, 0) and b.write (l_b.item, n * 4, 0)
+					and p.record (l_push.item, 28, (n + 255) // 256, 1, 1)
+					and ctx.pending_commands = 1
+					and c.read (l_c.item, n * 4, 0)
+				from i := 0 until not Result or i = n loop
+					Result := l_c.read_real_32 (i * 4) = (3 * i).to_real
+					i := i + 1
+				end
+				p.dispose
+			end
+			a.dispose; b.dispose; c.dispose
+		end
+
+	batched_increments: BOOLEAN
+			-- x := x + 1 recorded 1,000 times over the same buffer: only correct if
+			-- every barrier orders each dispatch after the previous one.
+		local
+			x: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_host, l_push: MANAGED_POINTER
+			i, n: INTEGER
+		do
+			n := 65_536
+			create x.make (ctx, n * 4)
+			create l_host.make (n * 4)
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (x.address, 0)
+				l_push.put_natural_32 (n.to_natural_32, 8)
+				Result := x.record_fill (0, n * 4, 0)
+				from i := 1 until not Result or i > 1000 loop
+					Result := p.record (l_push.item, 12, n // 256, 1, 1)
+					i := i + 1
+				end
+				Result := Result and ctx.pending_commands = 1001
+				ctx.flush
+				Result := Result and ctx.last_flush_succeeded and ctx.pending_commands = 0
+				Result := Result and x.read (l_host.item, n * 4, 0)
+				from i := 0 until not Result or i = n loop
+					Result := l_host.read_real_32 (i * 4) = 1000.0
+					i := i + 1
+				end
+				p.dispose
+			end
+			x.dispose
+		end
+
+	recorded_copy: BOOLEAN
+		local
+			a, b: VULKAN_DEVICE_BUFFER
+			l_host: MANAGED_POINTER
+		do
+			create a.make (ctx, 64)
+			create b.make (ctx, 64)
+			create l_host.make (64)
+			Result := a.record_fill (0, 64, 0x40400000) and b.record_fill (0, 64, 0)
+				and a.record_copy_to (b, 16, 32, 16)
+				and b.read (l_host.item, 64, 0)
+			Result := Result and l_host.read_real_32 (28) = 0.0 and l_host.read_real_32 (32) = 3.0
+				and l_host.read_real_32 (44) = 3.0 and l_host.read_real_32 (48) = 0.0
+			a.dispose; b.dispose
+		end
+
+	descriptor_sets_returned: BOOLEAN
+			-- Before 0.2.0 each descriptor pipeline took a set from a 32-set pool and
+			-- never returned it, and a failed set allocation still yielded a "valid"
+			-- pipeline. Now: 100 create/free cycles all succeed, and the last pipeline
+			-- still dispatches (writes 7.0 into every element).
+		local
+			s: VULKAN_SHADER
+			q: VULKAN_PIPELINE
+			buf: VULKAN_BUFFER
+			l_host: MANAGED_POINTER
+			l_spirv: MANAGED_POINTER
+			i: INTEGER
+		do
+			if attached (create {SIMPLE_SHADERC}.make).compile_compute (Legacy_glsl) as l_code then
+				l_spirv := l_code
+				create s.make_from_memory (ctx, l_spirv.item, l_spirv.count.to_integer_64)
+				Result := s.is_valid
+				from i := 1 until not Result or i > 99 loop
+					create q.make (ctx, s)
+					Result := q.is_valid
+					q.dispose
+					i := i + 1
+				end
+				create q.make (ctx, s)
+				create buf.make (ctx, 256, {VULKAN_BUFFER}.Buffer_storage)
+				create l_host.make (256)
+				Result := Result and q.is_valid and buf.is_valid and q.bind_buffer (0, buf) and q.dispatch (ctx, 1, 1, 1)
+					and buf.download (l_host.item, 256, 0)
+				from i := 0 until not Result or i = 64 loop
+					Result := l_host.read_real_32 (i * 4) = 7.0
+					i := i + 1
+				end
+				q.dispose
+				buf.dispose
+				s.dispose
+			end
+		end
+
+	deferred_release: BOOLEAN
+			-- A buffer released while a recorded dispatch still writes it is queued, the
+			-- dispatch still runs (the result copied out lands), and the flush frees it.
+		local
+			x, keep: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_push, l_host: MANAGED_POINTER
+		do
+			create x.make (ctx, 1024)
+			create keep.make (ctx, 1024)
+			create l_host.make (1024)
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (x.address, 0)
+				l_push.put_natural_32 (256, 8)
+				Result := x.record_fill (0, 1024, 0) and p.record (l_push.item, 12, 1, 1, 1)
+					and x.record_copy_to (keep, 0, 0, 1024)
+				x.release_deferred
+				Result := Result and not x.is_valid and ctx.queued_frees = 1
+				ctx.flush
+				Result := Result and ctx.queued_frees = 0 and keep.read (l_host.item, 1024, 0)
+					and l_host.read_real_32 (0) = 1.0 and l_host.read_real_32 (1020) = 1.0
+				x.release_deferred
+				Result := Result and ctx.queued_frees = 0
+				p.dispose
+			end
+			keep.dispose
+		end
+
+	pool_reuse: BOOLEAN
+			-- A buffer recycled while a recorded dispatch still writes it is handed to the next
+			-- same-size `make'; that new owner's fill is ordered after the old dispatch, so a
+			-- read shows the fill, not the old increments. Other sizes allocate fresh.
+		local
+			x, y, z, keep: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_push, l_host: MANAGED_POINTER
+			l_hits: INTEGER_64
+		do
+			ctx.trim_pool
+			ctx.flush
+			create x.make (ctx, 4096)
+			create keep.make (ctx, 4096)
+			create l_host.make (4096)
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (x.address, 0)
+				l_push.put_natural_32 (1024, 8)
+				l_hits := ctx.pool_hits
+				Result := x.record_fill (0, 4096, 0) and p.record (l_push.item, 12, 4, 1, 1)
+					and x.record_copy_to (keep, 0, 0, 4096)
+				x.recycle
+				Result := Result and ctx.pooled_bytes = 4096
+				create y.make (ctx, 4096)
+				Result := Result and ctx.pool_hits = l_hits + 1 and ctx.pooled_bytes = 0
+				Result := Result and y.record_fill (0, 4096, 0x40A00000) and y.read (l_host.item, 4096, 0)
+					and l_host.read_real_32 (0) = 5.0 and l_host.read_real_32 (4092) = 5.0
+				Result := Result and keep.read (l_host.item, 4096, 0) and l_host.read_real_32 (0) = 1.0
+				create z.make (ctx, 8192)
+				Result := Result and ctx.pool_hits = l_hits + 1
+				y.recycle
+				z.recycle
+				Result := Result and ctx.pooled_bytes = 4096 + 8192
+				ctx.set_pool_limit (5000)
+				Result := Result and ctx.pooled_bytes <= 5000
+				ctx.trim_pool
+				Result := Result and ctx.pooled_bytes = 0
+				ctx.set_pool_limit (1024 * 1024 * 1024)
+				p.dispose
+			end
+			keep.dispose
+		end
+
+	pool_size_classes: BOOLEAN
+			-- Device buffers are allocated at their size class (four per power of two), so a
+			-- recycled buffer serves any later request of the same class, at the size asked for;
+			-- a request of another class allocates fresh.
+		local
+			a, b, c: VULKAN_DEVICE_BUFFER
+			l_host: MANAGED_POINTER
+			l_hits: INTEGER_64
+		do
+			ctx.trim_pool
+			ctx.flush
+			create l_host.make (1020)
+			l_hits := ctx.pool_hits
+			create a.make (ctx, 1000)
+			a.recycle
+			Result := ctx.pooled_bytes = 1024
+			create b.make (ctx, 1020)
+			Result := Result and ctx.pool_hits = l_hits + 1 and ctx.pooled_bytes = 0 and b.size = 1020
+			Result := Result and b.record_fill (0, 1020, 0x40A00000) and b.read (l_host.item, 1020, 0)
+				and l_host.read_real_32 (0) = 5.0 and l_host.read_real_32 (1016) = 5.0
+			b.recycle
+			create c.make (ctx, 1100)
+			Result := Result and ctx.pool_hits = l_hits + 1 and ctx.pooled_bytes = 1024
+			c.recycle
+			Result := Result and ctx.pooled_bytes = 1024 + 1280
+			ctx.trim_pool
+			Result := Result and ctx.pooled_bytes = 0
+		end
+
+	recorded_uploads: BOOLEAN
+			-- Two small payloads and one of 8 MB (beyond an arena chunk) recorded into one batch,
+			-- the host buffer overwritten between them, then an increment over the first:
+			-- nothing flushes until the read, and every buffer holds its own payload.
+		local
+			a, b, c: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_host, l_big, l_push: MANAGED_POINTER
+			i, n_big: INTEGER
+		do
+			ctx.flush
+			n_big := 2 * 1024 * 1024
+			create a.make (ctx, 1024); create b.make (ctx, 1024); create c.make (ctx, n_big * 4)
+			create l_host.make (1024)
+			create l_big.make (n_big * 4)
+			from i := 0 until i = 256 loop l_host.put_real_32 (1.0, i * 4); i := i + 1 end
+			Result := a.record_write (l_host.item, 1024, 0)
+			from i := 0 until i = 256 loop l_host.put_real_32 (7.0, i * 4); i := i + 1 end
+			Result := Result and b.record_write (l_host.item, 1024, 0)
+			from i := 0 until i = n_big loop l_big.put_real_32 (i.to_real, i * 4); i := i + 1 end
+			Result := Result and c.record_write (l_big.item, n_big * 4, 0)
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (a.address, 0)
+				l_push.put_natural_32 (256, 8)
+				Result := Result and p.record (l_push.item, 12, 1, 1, 1)
+				Result := Result and ctx.pending_commands = 4
+				Result := Result and a.read (l_host.item, 1024, 0) and l_host.read_real_32 (0) = 2.0 and l_host.read_real_32 (1020) = 2.0
+				Result := Result and b.read (l_host.item, 1024, 0) and l_host.read_real_32 (0) = 7.0 and l_host.read_real_32 (1020) = 7.0
+				Result := Result and c.read (l_big.item, n_big * 4, 0) and l_big.read_real_32 (4) = 1.0
+					and l_big.read_real_32 ((n_big - 1) * 4) = (n_big - 1).to_real
+				p.dispose
+			end
+			a.dispose; b.dispose; c.dispose
+		end
+
+	profiling: BOOLEAN
+			-- 200 timed increments over 4M floats: 200 calls and a positive GPU time; with
+			-- profiling off, 50 more dispatches add nothing.
+		local
+			x: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_push: MANAGED_POINTER
+			i, n: INTEGER
+			l_ms: REAL_64
+		do
+			n := 4 * 1024 * 1024
+			create x.make (ctx, n * 4)
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (x.address, 0)
+				l_push.put_natural_32 (n.to_natural_32, 8)
+				ctx.set_profiling (True)
+				Result := ctx.is_profiling
+				from i := 1 until not Result or i > 200 loop
+					Result := p.record (l_push.item, 12, n // 256, 1, 1)
+					i := i + 1
+				end
+				ctx.flush
+				l_ms := p.profiled_ms
+				print ("(200 dispatches: " + l_ms.out + " ms GPU) ")
+				Result := Result and p.profiled_calls = 200 and l_ms > 0.0
+				ctx.set_profiling (False)
+				from i := 1 until not Result or i > 50 loop
+					Result := p.record (l_push.item, 12, n // 256, 1, 1)
+					i := i + 1
+				end
+				ctx.flush
+				Result := Result and p.profiled_calls = 200
+				p.reset_profile
+				Result := Result and p.profiled_calls = 0
+				p.dispose
+			end
+			x.dispose
+		end
+
+	async_submission: BOOLEAN
+			-- 0.7.0: a fill and 400 dependent increments of `x' (more than three slots' worth,
+			-- so the ring wraps) are submitted in slots of 128 while recording continues, with
+			-- no flush; they still run in order (every element ends at 400). A buffer released
+			-- while its slots are in flight is queued, not destroyed, until they complete;
+			-- likewise when no slot is open but one is in flight.
+		local
+			x, keep, y: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_push, l_host: MANAGED_POINTER
+			i: INTEGER
+		do
+			create x.make (ctx, 4096)
+			create keep.make (ctx, 4096)
+			create y.make (ctx, 4096)
+			create l_host.make (4096)
+			ctx.flush
+			if attached pipeline (Increment_glsl) as l_p then
+				p := l_p
+				create l_push.make (12)
+				l_push.put_natural_64 (x.address, 0)
+				l_push.put_natural_32 (1024, 8)
+				Result := x.record_fill (0, 4096, 0)
+				from i := 1 until not Result or i > 400 loop
+					Result := p.record (l_push.item, 12, 4, 1, 1)
+					i := i + 1
+				end
+				Result := Result and ctx.pending_commands = 401 and ctx.slots_in_flight >= 1
+				Result := Result and x.record_copy_to (keep, 0, 0, 4096)
+				x.release_deferred
+				Result := Result and ctx.queued_frees = 1
+				ctx.flush
+				Result := Result and ctx.last_flush_succeeded and ctx.queued_frees = 0 and ctx.slots_in_flight = 0
+				Result := Result and keep.read (l_host.item, 4096, 0)
+					and l_host.read_real_32 (0) = 400.0 and l_host.read_real_32 (4092) = 400.0
+					-- Exactly one slot's worth: it is submitted, none is open, one is in flight.
+				l_push.put_natural_64 (y.address, 0)
+				Result := Result and y.record_fill (0, 4096, 0)
+				from i := 2 until not Result or i > 128 loop
+					Result := p.record (l_push.item, 12, 4, 1, 1)
+					i := i + 1
+				end
+				Result := Result and ctx.slots_in_flight >= 1
+				y.release_deferred
+				Result := Result and ctx.queued_frees = 1
+				ctx.flush
+				Result := Result and ctx.queued_frees = 0
+				p.dispose
+			end
+			keep.dispose
+		end
+
+	cooperative_matrix_bf16: BOOLEAN
+			-- C = A B for 16 x 16 A and B of small integers (exact in bf16 and in the f32
+			-- accumulator), one subgroup on the cooperative-matrix path (0.6.0).
+		local
+			a, b, c: VULKAN_DEVICE_BUFFER
+			p: VULKAN_ADDRESS_PIPELINE
+			l_a, l_b, l_c, l_push: MANAGED_POINTER
+			i, j, k: INTEGER
+			l_sum: REAL_32
+		do
+			create l_a.make (1024); create l_b.make (1024); create l_c.make (1024)
+			from i := 0 until i = 256 loop
+				l_a.put_real_32 ((i \\ 7 - 3).to_real, i * 4)
+				l_b.put_real_32 ((i \\ 5 - 2).to_real, i * 4)
+				i := i + 1
+			end
+			create a.make (ctx, 1024); create b.make (ctx, 1024); create c.make (ctx, 1024)
+			if attached pipeline_for (Coop_bf16_glsl, True) as l_p then
+				p := l_p
+				create l_push.make (24)
+				l_push.put_natural_64 (a.address, 0)
+				l_push.put_natural_64 (b.address, 8)
+				l_push.put_natural_64 (c.address, 16)
+				Result := a.write (l_a.item, 1024, 0) and b.write (l_b.item, 1024, 0)
+					and p.record (l_push.item, 24, 1, 1, 1)
+					and c.read (l_c.item, 1024, 0)
+				from i := 0 until not Result or i = 16 loop
+					from j := 0 until not Result or j = 16 loop
+						l_sum := 0.0
+						from k := 0 until k = 16 loop
+							l_sum := l_sum + l_a.read_real_32 ((i * 16 + k) * 4) * l_b.read_real_32 ((k * 16 + j) * 4)
+							k := k + 1
+						end
+						Result := l_c.read_real_32 ((i * 16 + j) * 4) = l_sum
+						j := j + 1
+					end
+					i := i + 1
+				end
+				p.dispose
+			end
+			a.dispose; b.dispose; c.dispose
+		end
+
+feature {NONE} -- Helpers
+
+	pipeline (a_glsl: STRING): detachable VULKAN_ADDRESS_PIPELINE
+			-- Address pipeline for `a_glsl', or Void when compilation fails.
+		do
+			Result := pipeline_for (a_glsl, False)
+		end
+
+	pipeline_for (a_glsl: STRING; a_vulkan_1_3: BOOLEAN): detachable VULKAN_ADDRESS_PIPELINE
+			-- Address pipeline for `a_glsl', compiled for Vulkan 1.3 / SPIR-V 1.6 when
+			-- `a_vulkan_1_3'; Void when compilation fails.
+		local
+			s: VULKAN_SHADER
+			l_shaderc: SIMPLE_SHADERC
+		do
+			create l_shaderc.make
+			l_shaderc.set_target_vulkan_1_3 (a_vulkan_1_3)
+			if attached l_shaderc.compile_compute (a_glsl) as l_code then
+				create s.make_from_memory (ctx, l_code.item, l_code.count.to_integer_64)
+				if s.is_valid then
+					create Result.make (ctx, s)
+					s.dispose
+				end
+			else
+				print ("  (shader compile failed: " + l_shaderc.last_error + ")%N")
+			end
+			l_shaderc.dispose
+		end
+
+	check_that (a_name: STRING; a_ok: BOOLEAN)
+		do
+			print ("Test: " + a_name + "... ")
+			if a_ok then
+				print ("PASS%N")
+				passed := passed + 1
+			else
+				print ("FAIL%N")
+				failed := failed + 1
+			end
+		end
+
+feature {NONE} -- Shaders
+
+	Coop_bf16_glsl: STRING = "[
+		#version 460
+		#extension GL_EXT_buffer_reference : require
+		#extension GL_KHR_cooperative_matrix : require
+		#extension GL_KHR_memory_scope_semantics : require
+		#extension GL_EXT_bfloat16 : require
+		layout(local_size_x = 32) in;
+		layout(buffer_reference, std430, buffer_reference_align = 4) buffer F { float v[]; };
+		layout(push_constant) uniform P { F a; F b; F c; } p;
+		shared bfloat16_t As[256];
+		shared bfloat16_t Bs[256];
+		void main() {
+			uint t = gl_LocalInvocationID.x;
+			for (uint i = t; i < 256u; i += 32u) { As[i] = bfloat16_t(p.a.v[i]); Bs[i] = bfloat16_t(p.b.v[i]); }
+			barrier();
+			coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+			coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+			coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+			coopMatLoad(ma, As, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+			coopMatLoad(mb, Bs, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+			acc = coopMatMulAdd(ma, mb, acc);
+			coopMatStore(acc, p.c.v, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+		}
+	]"
+
+	Add_glsl: STRING = "[
+		#version 460
+		#extension GL_EXT_buffer_reference : require
+		layout(local_size_x = 256) in;
+		layout(buffer_reference, std430) buffer Floats { float v[]; };
+		layout(push_constant) uniform P { Floats a; Floats b; Floats c; uint n; } p;
+		void main() {
+			uint i = gl_GlobalInvocationID.x;
+			if (i < p.n) p.c.v[i] = p.a.v[i] + p.b.v[i];
+		}
+	]"
+
+	Increment_glsl: STRING = "[
+		#version 460
+		#extension GL_EXT_buffer_reference : require
+		layout(local_size_x = 256) in;
+		layout(buffer_reference, std430) buffer Floats { float v[]; };
+		layout(push_constant) uniform P { Floats x; uint n; } p;
+		void main() {
+			uint i = gl_GlobalInvocationID.x;
+			if (i < p.n) p.x.v[i] = p.x.v[i] + 1.0;
+		}
+	]"
+
+	Legacy_glsl: STRING = "[
+		#version 450
+		layout(local_size_x = 64) in;
+		layout(std430, binding = 0) buffer B { float v[]; };
+		void main() { v[gl_GlobalInvocationID.x] = 7.0; }
+	]"
+
+end

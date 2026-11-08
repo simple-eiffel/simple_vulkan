@@ -4,3 +4,4 @@ EIFGENs/
 *.melted
 *.epr
 *.log
+*.o
