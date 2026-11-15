@@ -37,6 +37,12 @@ feature -- Tests
 			create batch.make
 			batch.run_all
 			print ("Batch results: " + batch.passed.out + " passed, " + batch.failed.out + " failed%N")
+			if tests.failed + batch.failed > 0 then
+					-- port-coordination #17: a batch failure printed only "FAIL" and the program
+					-- exited 0, so nothing reading it saw a failure. Say it, and exit 1.
+				print ("TESTS FAILED%N")
+				(create {EXCEPTIONS}).die (1)
+			end
 		end
 
 end
